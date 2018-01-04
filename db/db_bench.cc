@@ -26,6 +26,12 @@ static int FLAGS_value_size = 100;
 static int FLAGS_threads = 1;
 // Use the db with the following name.
 static const char* FLAGS_db = NULL;
+// Bloom filter bits per key.
+// Negative means use default settings.
+static int FLAGS_bloom_bits = -1;
+
+
+
 
 namespace leveldb{
 
@@ -159,6 +165,12 @@ struct SharedState{
 	pthread_cond_t cond;
 	int start_num;
 	int end_num;
+	
+	SharedState()
+	{
+		pthread_mutex_init(&mu, NULL);
+		pthread_cond_init(&cond, NULL);
+	}
 };
 
 
@@ -174,16 +186,16 @@ private:
 	//const char *db_name_;
 	DB* db_;
 	Cache* cache_;
-
-	int bloom_bits_=2;
-
-	WriteOptions write_options_;
 	
+	int value_size_;
 	int entries_per_batch_;
 	int num_;
-	int value_size_;
+		
+	WriteOptions write_options_;
 	
 	Random rand;
+	
+	
 	
 	struct ThreadArg{
 		SharedState* shared;
@@ -309,11 +321,11 @@ private:
 	
 	void RunBenchmark(int nThreads, std::string name, void (Benchmark::*method)(ThreadState*))
 	{
-		SharedState *shared;
+		SharedState shared;
 		
 		ThreadArg arg;
 		arg.bm=this;
-		arg.shared=shared;
+		arg.shared=&shared;
 		arg.thread=new ThreadState(name);
 		//arg.thread.name=name;
 		arg.function=method;
@@ -321,19 +333,17 @@ private:
 			g_env->StartThread(ThreadBody, &arg);
 		
 		
-		// ???
-		/* shared.mu.lock();
-		
-		while(shared.start_num < nThreads)
-			shared.cond.wait();
+		// 保证 所有线程退出，不用担心 线程引用 shared和arg.thread对象
+		pthread_mutex_lock(&shared.mu);
 		
 		while(shared.end_num < nThreads)
-			shared.cond.wait();
+			pthread_cond_wait(&shared.cond, &shared.mu);
 		
-		shared.mu.unlock(); */
+		pthread_mutex_unlock(&shared.mu);
 		
-		arg.thread->Report();
 		
+		assert(shared.end_num == nThreads);		
+		arg.thread->Report(); 		
 	}
 	
 	static void ThreadBody(void *a)
@@ -357,13 +367,13 @@ private:
 public:
 
 	Benchmark()
-	: db_(NULL),
-	rand(301),
+	: db_(NULL),	
 	cache_(FLAGS_cache_size>=0 ? NewLRUCache(FLAGS_cache_size) : NULL),
-	num_(FLAGS_num),
-	entries_per_batch_(1),
 	value_size_(FLAGS_value_size),
-	write_options_(WriteOptions())
+	entries_per_batch_(1),
+	num_(FLAGS_num),
+	write_options_(WriteOptions()),
+	rand(301)
 	{}
 	
 	~Benchmark()
@@ -451,7 +461,7 @@ public:
 		options.max_file_size=leveldb::Options().max_file_size;
 		options.block_size=leveldb::Options().block_size;
 		options.max_open_files=leveldb::Options().max_open_files;
-		options.filter_policy= NewBloomFilterPolicy(bloom_bits_);
+		options.filter_policy= NewBloomFilterPolicy(FLAGS_bloom_bits);
 		options.reuse_logs=false; // ???
 		
 		
@@ -491,7 +501,7 @@ int main(int argc, char** argv)
 	for(int i=0; i<argc; i++)
 	{
 		int n;
-		char* c;
+		char c;
 		/* if(std::string(argv[i])=="--benchmarks"  &&  i<argc-1)
 		{
 			FLAGS_benchmarks=argv[i+1];
@@ -501,22 +511,24 @@ int main(int argc, char** argv)
 		{
 			FLAGS_benchmarks=argv[i]+strlen("--benchmarks=");
 		} 
-		else if(sscanf(argv[i], "--cache_size=%d%s", &n, c)==1)
+		else if(sscanf(argv[i], "--cache_size=%d%s", &n, &c)==1)
 		{
 			FLAGS_cache_size=n;
 		}
-		else if(sscanf(argv[i], "--compression_ratio=%d%s", &n, c)==1)
+		else if(sscanf(argv[i], "--compression_ratio=%d%s", &n, &c)==1)
 		{
 			FLAGS_compression_ratio=n;
 		}
-		else if(sscanf(argv[i], "--num=%d%s", &n, c)==1)
+		else if(sscanf(argv[i], "--num=%d%s", &n, &c)==1)
 		{
 			FLAGS_num=n;
 		}
 		else if (sscanf(argv[i], "--threads=%d%c", &n, &c) == 1) {
 		  FLAGS_threads = n;
 		}
-		
+		else if (sscanf(argv[i], "--bloom_bits=%d%c", &n, &c) == 1) {
+		  FLAGS_bloom_bits = n;
+		}
 	}
 	
 	leveldb::g_env=leveldb::Env::Default();
