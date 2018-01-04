@@ -70,6 +70,22 @@ Slice CompressibleString(Random *rnd, double compressed_fraction, size_t len, st
 }
 
 
+#if defined(__linux)
+static Slice TrimSpace(Slice s) {
+  size_t start = 0;
+  while (start < s.size() && isspace(s[start])) {
+    start++;
+  }
+  size_t limit = s.size();
+  while (limit > start && isspace(s[limit-1])) {
+    limit--;
+  }
+  return Slice(s.data() + start, limit - start);
+}
+#endif
+
+
+
 // 类RandomGenerator作用：
 // 预先生成一个足够长 1048576 的随机数组，用来快速获得指定长度的随机数组
 class RandomGenerator{
@@ -114,6 +130,8 @@ public:
 	{}
 	
 	void Update();
+	void hasWrite(int n)
+	{ bytes+=n; }
 	void Report();
 };
 
@@ -126,7 +144,7 @@ void ThreadState::Update()
 void ThreadState::Report()
 {
 	time_t end=time(NULL);
-	double speed1=(end-start)*1000/op;
+	double speed1=(end-start)*1000/ops;
 	double speed2=bytes/1024/1024/(end-start);
 	fprintf(stderr, "%s		: 		%f micros/op; %f MB/s", name, speed1, speed2);
 }
@@ -142,11 +160,7 @@ struct SharedState{
 
 
 
-struct ThreadArg{
-	SharedState* shared;
-	ThreadState* thread;
-	void (*function)();
-};
+
 
 
 
@@ -168,7 +182,14 @@ private:
 	
 	Random rand;
 	
-	
+	struct ThreadArg{
+		SharedState* shared;
+		ThreadState* thread;
+		Benchmark *bm;
+		void (Benchmark::*function)(ThreadState*);
+	};
+
+
 	void PrintHeader() {
 		const int kKeySize = 16;
 		PrintEnvironment();
@@ -240,15 +261,11 @@ private:
   
 	
 	void DoWrite(ThreadState* thread, bool seq)
-	{
-		write_options_=WriteOptions();
-		write_options_.sync=true; // ??
-		
+	{		
 		WriteBatch batch;
 		RandomGenerator gen;  // 生成 随机 value
-		
-		entries_per_batch_=10; // 每次batch 写的数目
-		
+		Status s;
+		int nbytes=0;
 		
 		for(int i=0; i<num_; i+= entries_per_batch_)
 		{
@@ -262,9 +279,10 @@ private:
 				value_size_=10; // value 大小
 				batch.Put(key, gen.Generate(value_size_));
 				// 统计 一次Put操作
-				thread.Update();
+				thread->Update();
+				nbytes+= strlen(key) + value_size_;
 			}
-			Status s=db_->Write(write_options_, &batch);
+			s=db_->Write(write_options_, &batch);
 			// 统计 一个batch的Write操作
 			if(!s.ok())
 			{
@@ -272,8 +290,8 @@ private:
 				exit(1);
 			}
 		}
-		int nbytes=num_*(sizeof key + value_size_);
-		thread.hasWrite(nbytes);
+		//int nbytes=num_*(sizeof key + value_size_);
+		thread->hasWrite(nbytes);
 	}
 	
 	/* void RunBenchmark(int nThreads, void (Benchmark::*method)())
@@ -286,17 +304,18 @@ private:
 	} */
 
 	
-	void RunBenchmark(int nThreads, char* name, void (Benchmark::*method)())
+	void RunBenchmark(int nThreads, char* name, void (Benchmark::*method)(ThreadState*))
 	{
 		SharedState *shared;
 		
-		ThreadArg* arg;
+		ThreadArg arg;
+		arg.bm=this;
 		arg.shared=shared;
 		arg.thread=new ThreadState(name);
 		//arg.thread.name=name;
 		arg.function=method;
 		for(int i=0; i<nThreads; i++)
-			g_env->StartThread(ThreadBody, arg);
+			g_env->StartThread(ThreadBody, &arg);
 		
 		
 		// ???
@@ -310,23 +329,24 @@ private:
 		
 		shared.mu.unlock(); */
 		
-		arg.thread.Report();
+		arg.thread->Report();
 		
 	}
 	
-	void ThreadBody(void *arg)
+	static void ThreadBody(void *a)
 	{
-		ThreadArg* arg=static_cast<ThreadArg*>(arg);
-		ThreadState* thread=arg.thread;
-		void (*function)()=arg.function;
+		ThreadArg* arg=static_cast<ThreadArg*>(a);
+		ThreadState* thread=arg->thread;
 		
 		
-		arg.shared.start_num++;
 		
+		arg->shared->start_num++;
 		
-		function(thread);
+		//void (*function)(ThreadState*)=arg->function;
+		//function(thread);
+		(arg->bm->*(arg->function))(thread);
 		
-		arg.shared.end_num++;
+		arg->shared->end_num++;
 	}
   
   
@@ -336,10 +356,11 @@ public:
 	Benchmark()
 	: db_(NULL),
 	rand(301),
-	cache_(FLAGS_cache_size>=0 ? NewLRUCache(FLAGS_cache_size) : NULL)
-	num_(FLAGS_num)
-	entries_per_batch_(1)
-	value_size_(FLAGS_value_size)
+	cache_(FLAGS_cache_size>=0 ? NewLRUCache(FLAGS_cache_size) : NULL),
+	num_(FLAGS_num),
+	entries_per_batch_(1),
+	value_size_(FLAGS_value_size),
+	write_options_(WriteOptions())
 	{}
 	
 	~Benchmark()
@@ -379,27 +400,31 @@ public:
 			
 			
 			int num_threads=FLAGS_threads;
-			void (Benchmark::*method)()=NULL;
+			void (Benchmark::*method)(ThreadState*)=NULL;
 			
 			if(name=="WriteSeq")
 				method=&Benchmark::WriteSeq;
 			else if(name=="WriteRandom")
 				method=&Benchmark::WriteRandom;
-			else if (name == Slice("fillsync")) 
+			else if (name == "fillsync")
 			{
 				num_ /= 1000;
 				write_options_.sync = true;
 				method = &Benchmark::WriteRandom;
-			} else if (name == Slice("fill100K")) 
+			} else if (name == "fill100K")
 			{
 				num_ /= 1000;
 				value_size_ = 100 * 1000;
 				method = &Benchmark::WriteRandom;
 			}
+			else if (name == "fillbatch") {
+				entries_per_batch_ = 1000;
+				method = &Benchmark::WriteSeq;
+			}
 			
 			if(method)
 			{
-				(this->*method)();
+				//(this->*method)();
 			// 创建多个线程 执行method，
 			// 等待每个线程的启动 和完成，执行完成后 汇总并打印状态
 			// 
@@ -484,9 +509,10 @@ int main(int argc, char** argv)
 		{
 			FLAGS_num=n;
 		}
-		else if (sscanf(argv[i], "--threads=%d%c", &n, &junk) == 1) {
+		else if (sscanf(argv[i], "--threads=%d%c", &n, &c) == 1) {
 		  FLAGS_threads = n;
 		}
+		
 	}
 	
 	leveldb::g_env=leveldb::Env::Default();
