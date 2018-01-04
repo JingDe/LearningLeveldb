@@ -19,7 +19,7 @@
 static const char* FLAGS_benchmarks="WriteSeq,WriteRandom";
 static double FLAGS_compression_ratio=0.5;
 static int FLAGS_cache_size = -1;
-static int FLAGS_num=50; // 写进 数据库 的总的key value 对数
+static int FLAGS_num=1000000; // 写进 数据库 的总的key value 对数
 // Size of each value
 static int FLAGS_value_size = 100;
 // Number of concurrent threads to run.
@@ -120,14 +120,16 @@ public:
 
 class ThreadState{
 private:
-	char* name;
+	std::string name;
 	int ops;
 	time_t start;
 	int bytes;
 	
 public:
-	ThreadState(char *n):name(n),start(time(NULL)) // epoch后的秒数
-	{}
+	ThreadState(std::string n):name(n),start(time(NULL)) // epoch后的秒数
+	{
+		fprintf(stderr, "%d\n", start);
+	}
 	
 	void Update();
 	void hasWrite(int n)
@@ -145,8 +147,9 @@ void ThreadState::Report()
 {
 	time_t end=time(NULL);
 	double speed1=(end-start)*1000/ops;
+	fprintf(stderr, "%d %d %d %d\n", bytes, end, start, end-start);
 	double speed2=bytes/1024/1024/(end-start);
-	fprintf(stderr, "%s		: 		%f micros/op; %f MB/s", name, speed1, speed2);
+	fprintf(stderr, "%s		: 		%f micros/op; %f MB/s", name.c_str(), speed1, speed2);
 }
 
 
@@ -304,7 +307,7 @@ private:
 	} */
 
 	
-	void RunBenchmark(int nThreads, char* name, void (Benchmark::*method)(ThreadState*))
+	void RunBenchmark(int nThreads, std::string name, void (Benchmark::*method)(ThreadState*))
 	{
 		SharedState *shared;
 		
@@ -493,7 +496,8 @@ int main(int argc, char** argv)
 		{
 			FLAGS_benchmarks=argv[i+1];
 		} */
-		if(std::string(argv[i]).starts_with("--benchmarks="))
+		//if(std::string(argv[i]).starts_with("--benchmarks="))
+		if(memcmp(argv[i], "--benchmarks=", strlen("--benchmarks="))==0)
 		{
 			FLAGS_benchmarks=argv[i]+strlen("--benchmarks=");
 		} 
