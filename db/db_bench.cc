@@ -13,13 +13,15 @@
 #include "util/mutexlock.h"
 #include "util/random.h"
 #include "util/testutil.h"
-
+#include<sys/time.h>
 
 
 static const char* FLAGS_benchmarks="WriteSeq,WriteRandom";
 static double FLAGS_compression_ratio=0.5;
 static int FLAGS_cache_size = -1;
-static int FLAGS_num=1000000; // 写进 数据库 的总的key value 对数
+// 写进 数据库 的总的key value 对数
+//static int FLAGS_num=1000000; 
+static int FLAGS_num=1000;
 // Size of each value
 static int FLAGS_value_size = 100;
 // Number of concurrent threads to run.
@@ -29,6 +31,18 @@ static const char* FLAGS_db = NULL;
 // Bloom filter bits per key.
 // Negative means use default settings.
 static int FLAGS_bloom_bits = -1;
+
+// If true, do not destroy the existing database.  If you set this
+// flag and also specify a benchmark that wants a fresh database, that
+// benchmark will fail.
+static bool FLAGS_use_existing_db = false;
+
+// Number of bytes to buffer in memtable before compacting
+// (initialized to default value by "main")
+static int FLAGS_write_buffer_size = 0;
+
+// If true, reuse existing log/MANIFEST files when re-opening a database.
+static bool FLAGS_reuse_logs = false;
 
 
 
@@ -123,18 +137,27 @@ public:
 };
 
 
+int64_t microSeconds()
+{
+	struct timeval tm;
+	gettimeofday(&tm, NULL);
+	return static_cast<uint64_t>(tm.tv_sec*1000000 + tm.tv_usec);
+}
+
 
 class ThreadState{
 private:
 	std::string name;
 	int ops;
-	time_t start;
 	int bytes;
+	//time_t start;
+	int64_t start; // 微秒
+	
 	
 public:
-	ThreadState(std::string n):name(n),start(time(NULL)) // epoch后的秒数
+	ThreadState(std::string n):name(n),ops(0),bytes(0),start(microSeconds()) // epoch后的秒数
 	{
-		fprintf(stderr, "%d\n", start);
+		
 	}
 	
 	void Update();
@@ -146,21 +169,25 @@ public:
 void ThreadState::Update()
 {
 	ops++;
-	fprintf(stderr, "... finished %dops", ops++);
+	fprintf(stderr, "... finished %dops %30s\r", ops, "");
 }
 
 void ThreadState::Report()
 {
-	time_t end=time(NULL);
-	double speed1=(end-start)*1000/ops;
-	fprintf(stderr, "%d %d %d %d\n", bytes, end, start, end-start);
-	double speed2=bytes/1024/1024/(end-start);
-	fprintf(stderr, "%s		: 		%f micros/op; %f MB/s", name.c_str(), speed1, speed2);
-}
+	//time_t end=time(NULL);
+	uint64_t end=microSeconds();
+	uint64_t diff=end-start;
+	fprintf(stdout, "start=%lld, finish=%lld, seconds=%lld, ops=%ld\n", start, end, diff, ops);
+	double speed1=(end-start)/ops;
+	
+	double speed2=bytes/1024/1024/diff;
+	fprintf(stdout, "%s		: 		%f micros/op; %f MB/s", name.c_str(), speed1, speed2);
+} 
 
 
 
-struct SharedState{
+class SharedState{
+public:
 	pthread_mutex_t mu;
 	pthread_cond_t cond;
 	int start_num;
@@ -168,8 +195,15 @@ struct SharedState{
 	
 	SharedState()
 	{
+		start_num=0;
+		end_num=0;
 		pthread_mutex_init(&mu, NULL);
 		pthread_cond_init(&cond, NULL);
+	}
+	~SharedState()
+	{
+		pthread_mutex_destroy(&mu);
+		pthread_cond_destroy(&cond);
 	}
 };
 
@@ -280,7 +314,9 @@ private:
 		WriteBatch batch;
 		RandomGenerator gen;  // 生成 随机 value
 		Status s;
-		int nbytes=0;
+		int64_t nbytes=0;
+		
+		fprintf(stdout, "num=%d\n", num_);
 		
 		for(int i=0; i<num_; i+= entries_per_batch_)
 		{
@@ -291,14 +327,13 @@ private:
 				char key[100];
 				snprintf(key, sizeof key, "%016d", k);
 				
-				value_size_=10; // value 大小
+				value_size_=10; 
 				batch.Put(key, gen.Generate(value_size_));
-				// 统计 一次Put操作
+				
 				thread->Update();
 				nbytes+= strlen(key) + value_size_;
 			}
 			s=db_->Write(write_options_, &batch);
-			// 统计 一个batch的Write操作
 			if(!s.ok())
 			{
 				fprintf(stderr, "put error: %s\n", s.ToString().c_str());
@@ -343,7 +378,8 @@ private:
 		
 		
 		assert(shared.end_num == nThreads);		
-		arg.thread->Report(); 		
+		arg.thread->Report(); 	
+		delete arg.thread;
 	}
 	
 	static void ThreadBody(void *a)
@@ -374,7 +410,11 @@ public:
 	num_(FLAGS_num),
 	write_options_(WriteOptions()),
 	rand(301)
-	{}
+	{
+		if (!FLAGS_use_existing_db) {
+		  DestroyDB(FLAGS_db, Options());
+		}
+	}
 	
 	~Benchmark()
 	{
@@ -454,20 +494,18 @@ public:
 		assert(db_==NULL);
 		Options options;
 		options.env=g_env;
-		options.create_if_missing=true;
+		options.create_if_missing=!FLAGS_use_existing_db;
 		// options.error_if_exists = true;
 		options.block_cache=cache_;
-		options.write_buffer_size=leveldb::Options().write_buffer_size;
+		options.write_buffer_size=FLAGS_write_buffer_size;
 		options.max_file_size=leveldb::Options().max_file_size;
 		options.block_size=leveldb::Options().block_size;
 		options.max_open_files=leveldb::Options().max_open_files;
 		options.filter_policy= NewBloomFilterPolicy(FLAGS_bloom_bits);
-		options.reuse_logs=false; // ???
+		options.reuse_logs=FLAGS_reuse_logs; // ???
 		
 		
-		Status s;
-		s=DB::Open(options, FLAGS_db, &db_); // 在当前目录CreateDir
-		//s=DB::Open(options, db_name_, &db_);
+		Status s=DB::Open(options, FLAGS_db, &db_);
 		if(!s.ok())
 		{
 			fprintf(stderr, "open error: %s\n", s.ToString().c_str());
@@ -494,8 +532,16 @@ public:
 
 }
 
-int main(int argc, char** argv)
+void myGetTestDirectory(std::string* path)
 {
+	*path=".";
+	//*path="/home/wangjing/workspace/leveldb_study/leveldb-master/mytests";
+}
+
+int main(int argc, char** argv)
+{	
+	FLAGS_write_buffer_size = leveldb::Options().write_buffer_size;
+  
 	std::string  default_db_path;
 	
 	for(int i=0; i<argc; i++)
@@ -529,6 +575,16 @@ int main(int argc, char** argv)
 		else if (sscanf(argv[i], "--bloom_bits=%d%c", &n, &c) == 1) {
 		  FLAGS_bloom_bits = n;
 		}
+		else if (sscanf(argv[i], "--use_existing_db=%d%c", &n, &c) == 1  &&  (n == 0 || n == 1)) {
+		  FLAGS_use_existing_db = n;
+		}
+		else if (sscanf(argv[i], "--write_buffer_size=%d%c", &n, &c) == 1) {
+		  FLAGS_write_buffer_size = n;
+		}
+		else if (sscanf(argv[i], "--reuse_logs=%d%c", &n, &c) == 1 &&
+               (n == 0 || n == 1)) {
+		  FLAGS_reuse_logs = n;
+		}
 	}
 	
 	leveldb::g_env=leveldb::Env::Default();
@@ -536,7 +592,8 @@ int main(int argc, char** argv)
 	// 指定 数据库文件所在目录
 	if(FLAGS_db==NULL)
 	{
-		leveldb::g_env->GetTestDirectory(&default_db_path);
+		//leveldb::g_env->GetTestDirectory(&default_db_path);
+		myGetTestDirectory(&default_db_path);
 		default_db_path+="/dbbench";
 		FLAGS_db=default_db_path.c_str();
 	}
