@@ -6,6 +6,7 @@
 #include "leveldb/cache.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
+#include "env.h"
 #include "leveldb/write_batch.h"
 #include "port/port.h"
 #include "util/crc32c.h"
@@ -16,12 +17,13 @@
 #include<sys/time.h>
 
 
-static const char* FLAGS_benchmarks="WriteSeq,WriteRandom";
+static const char* FLAGS_benchmarks="WriteSeq";
 static double FLAGS_compression_ratio=0.5;
 static int FLAGS_cache_size = -1;
+
 // 写进 数据库 的总的key value 对数
-//static int FLAGS_num=1000000; 
-static int FLAGS_num=1000;
+static int FLAGS_num=1000000; 
+
 // Size of each value
 static int FLAGS_value_size = 100;
 // Number of concurrent threads to run.
@@ -44,7 +46,16 @@ static int FLAGS_write_buffer_size = 0;
 // If true, reuse existing log/MANIFEST files when re-opening a database.
 static bool FLAGS_reuse_logs = false;
 
+// Number of bytes written to each file.
+// (initialized to default value by "main")
+static int FLAGS_max_file_size = 0;
 
+// Approximate size of user data packed per block (before compression.
+// (initialized to default value by "main")
+static int FLAGS_block_size = 0;
+
+// Maximum number of files to keep open at the same time (use default if == 0)
+static int FLAGS_open_files = 0;
 
 
 namespace leveldb{
@@ -148,14 +159,15 @@ int64_t microSeconds()
 class ThreadState{
 private:
 	std::string name;
-	int ops;
+	int next_report_;
+	int ops_;
 	int bytes;
 	//time_t start;
 	int64_t start; // 微秒
 	
 	
 public:
-	ThreadState(std::string n):name(n),ops(0),bytes(0),start(microSeconds()) // epoch后的秒数
+	ThreadState(std::string n):name(n),next_report_(10),ops_(0),bytes(0),start(microSeconds()) // epoch后的秒数
 	{
 		
 	}
@@ -168,8 +180,20 @@ public:
 
 void ThreadState::Update()
 {
-	ops++;
-	fprintf(stderr, "... finished %dops %30s\r", ops, "");
+	ops_++;
+	if(ops_>=next_report_)
+	{	
+		if      (next_report_ < 100)    next_report_ += 10;
+		else if (next_report_ < 1000)   next_report_ += 100;
+        else if (next_report_ < 5000)   next_report_ += 500;
+        else if (next_report_ < 10000)  next_report_ += 1000;
+        else if (next_report_ < 50000)  next_report_ += 5000;
+        else if (next_report_ < 100000) next_report_ += 10000;
+        else if (next_report_ < 500000) next_report_ += 50000;
+        else                            next_report_ += 100000;
+		fprintf(stderr, "... finished %d ops\r", ops_);
+		fflush(stderr);
+	}
 }
 
 void ThreadState::Report()
@@ -177,11 +201,11 @@ void ThreadState::Report()
 	//time_t end=time(NULL);
 	uint64_t end=microSeconds();
 	uint64_t diff=end-start;
-	fprintf(stdout, "start=%lld, finish=%lld, seconds=%lld, ops=%ld\n", start, end, diff, ops);
-	double speed1=(end-start)/ops;
+	fprintf(stdout, "microSeconds=%lld, ops=%ld, bytes=%d\n", diff, ops_, bytes);
+	double speed1=(end-start)/ops_;
 	
-	double speed2=bytes/1024/1024/diff;
-	fprintf(stdout, "%s		: 		%f micros/op; %f MB/s", name.c_str(), speed1, speed2);
+	double speed2=bytes*1000000/1024/1024/diff;
+	fprintf(stdout, "%s		: 		%f micros/op; %f MB/s\n", name.c_str(), speed1, speed2);
 } 
 
 
@@ -190,11 +214,13 @@ class SharedState{
 public:
 	pthread_mutex_t mu;
 	pthread_cond_t cond;
+	int total;
 	int start_num;
 	int end_num;
 	
-	SharedState()
+	SharedState(int t)
 	{
+		total=t;
 		start_num=0;
 		end_num=0;
 		pthread_mutex_init(&mu, NULL);
@@ -220,7 +246,7 @@ private:
 	//const char *db_name_;
 	DB* db_;
 	Cache* cache_;
-	
+	const FilterPolicy* filter_policy_;
 	int value_size_;
 	int entries_per_batch_;
 	int num_;
@@ -310,30 +336,29 @@ private:
   
 	
 	void DoWrite(ThreadState* thread, bool seq)
-	{		
+	{
 		WriteBatch batch;
 		RandomGenerator gen;  // 生成 随机 value
 		Status s;
 		int64_t nbytes=0;
-		
-		fprintf(stdout, "num=%d\n", num_);
-		
+				
 		for(int i=0; i<num_; i+= entries_per_batch_)
 		{
 			batch.Clear();
 			for(int j=0; j<entries_per_batch_; j++)
 			{
-				int k= seq ? i+j : rand.Next() % num_;
+				const int k= seq ? i+j : (rand.Next() % FLAGS_num);
 				char key[100];
 				snprintf(key, sizeof key, "%016d", k);
 				
-				value_size_=10; 
 				batch.Put(key, gen.Generate(value_size_));
 				
-				thread->Update();
 				nbytes+= strlen(key) + value_size_;
+				thread->Update();
 			}
+											
 			s=db_->Write(write_options_, &batch);
+						
 			if(!s.ok())
 			{
 				fprintf(stderr, "put error: %s\n", s.ToString().c_str());
@@ -356,7 +381,7 @@ private:
 	
 	void RunBenchmark(int nThreads, std::string name, void (Benchmark::*method)(ThreadState*))
 	{
-		SharedState shared;
+		SharedState shared(nThreads);
 		
 		ThreadArg arg;
 		arg.bm=this;
@@ -364,15 +389,17 @@ private:
 		arg.thread=new ThreadState(name);
 		//arg.thread.name=name;
 		arg.function=method;
+		
+		
 		for(int i=0; i<nThreads; i++)
 			g_env->StartThread(ThreadBody, &arg);
-		
 		
 		// 保证 所有线程退出，不用担心 线程引用 shared和arg.thread对象
 		pthread_mutex_lock(&shared.mu);
 		
 		while(shared.end_num < nThreads)
 			pthread_cond_wait(&shared.cond, &shared.mu);
+		
 		
 		pthread_mutex_unlock(&shared.mu);
 		
@@ -386,16 +413,20 @@ private:
 	{
 		ThreadArg* arg=static_cast<ThreadArg*>(a);
 		ThreadState* thread=arg->thread;
+		SharedState* shared=arg->shared;
 		
 		
-		
-		arg->shared->start_num++;
+		shared->start_num++;
 		
 		//void (*function)(ThreadState*)=arg->function;
 		//function(thread);
 		(arg->bm->*(arg->function))(thread);
 		
-		arg->shared->end_num++;
+		pthread_mutex_lock(&shared->mu);
+		shared->end_num++;
+		if(shared->end_num==shared->total)
+			pthread_cond_signal(&shared->cond);
+		pthread_mutex_unlock(&shared->mu);
 	}
   
   
@@ -405,12 +436,25 @@ public:
 	Benchmark()
 	: db_(NULL),	
 	cache_(FLAGS_cache_size>=0 ? NewLRUCache(FLAGS_cache_size) : NULL),
+	filter_policy_(FLAGS_bloom_bits >= 0
+                   ? NewBloomFilterPolicy(FLAGS_bloom_bits)
+                   : NULL),
 	value_size_(FLAGS_value_size),
 	entries_per_batch_(1),
 	num_(FLAGS_num),
 	write_options_(WriteOptions()),
 	rand(301)
 	{
+		//删除已存在的数据库文件，删除数据库
+		std::vector<std::string> files;
+		//g_env->GetChildren(FLAGS_db, &files);
+		MyGetChildren(FLAGS_db, &files);
+		for(size_t i=0; i<files.size(); i++)
+		{
+			if(strcmp(files[i].c_str(), "heap-")==0)
+				MyDeleteFile(std::string(FLAGS_db)+"/"+files[i]);
+				//g_env->DeleteFile(std::string(FLAGS_db) + "/" +files[i]);
+		}
 		if (!FLAGS_use_existing_db) {
 		  DestroyDB(FLAGS_db, Options());
 		}
@@ -422,8 +466,26 @@ public:
 			delete db_;
 		if(cache_)
 			delete cache_;
+		if(filter_policy_)
+			delete filter_policy_;
 	}
 	
+	void ClearDB()
+	{
+		//删除已存在的数据库文件，删除数据库
+		std::vector<std::string> files;
+		//g_env->GetChildren(FLAGS_db, &files);
+		MyGetChildren(FLAGS_db, &files);
+		for(size_t i=0; i<files.size(); i++)
+		{
+			if(strcmp(files[i].c_str(), "heap-")==0)
+				MyDeleteFile(std::string(FLAGS_db)+"/"+files[i]);
+				//g_env->DeleteFile(std::string(FLAGS_db) + "/" +files[i]);
+		}
+		if (!FLAGS_use_existing_db) {
+		  DestroyDB(FLAGS_db, Options());
+		}
+	}
 		
 	void Run()
 	{
@@ -484,7 +546,7 @@ public:
 				RunBenchmark(num_threads, name, method);
 			}
 		}
-				
+		ClearDB();
 	}
 
 	
@@ -498,20 +560,18 @@ public:
 		// options.error_if_exists = true;
 		options.block_cache=cache_;
 		options.write_buffer_size=FLAGS_write_buffer_size;
-		options.max_file_size=leveldb::Options().max_file_size;
-		options.block_size=leveldb::Options().block_size;
-		options.max_open_files=leveldb::Options().max_open_files;
-		options.filter_policy= NewBloomFilterPolicy(FLAGS_bloom_bits);
-		options.reuse_logs=FLAGS_reuse_logs; // ???
-		
-		
+		options.max_file_size=FLAGS_max_file_size;
+		options.block_size=FLAGS_block_size;
+		options.max_open_files=FLAGS_open_files;
+		options.filter_policy= filter_policy_;
+		options.reuse_logs=FLAGS_reuse_logs; 
+				
 		Status s=DB::Open(options, FLAGS_db, &db_);
 		if(!s.ok())
 		{
 			fprintf(stderr, "open error: %s\n", s.ToString().c_str());
 			exit(1);
-		} 
-		
+		}		
 	}
 
 
@@ -541,6 +601,9 @@ void myGetTestDirectory(std::string* path)
 int main(int argc, char** argv)
 {	
 	FLAGS_write_buffer_size = leveldb::Options().write_buffer_size;
+	FLAGS_max_file_size = leveldb::Options().max_file_size;
+	FLAGS_block_size = leveldb::Options().block_size;
+	FLAGS_open_files = leveldb::Options().max_open_files;
   
 	std::string  default_db_path;
 	
@@ -585,6 +648,21 @@ int main(int argc, char** argv)
                (n == 0 || n == 1)) {
 		  FLAGS_reuse_logs = n;
 		}
+		else if (sscanf(argv[i], "--value_size=%d%c", &n, &c) == 1) {
+		  FLAGS_value_size = n;
+		}
+		else if (sscanf(argv[i], "--max_file_size=%d%c", &n, &c) == 1) {
+		  FLAGS_max_file_size = n;
+		}
+		else if (sscanf(argv[i], "--block_size=%d%c", &n, &c) == 1) {
+		  FLAGS_block_size = n;
+		}
+		else if (sscanf(argv[i], "--block_size=%d%c", &n, &c) == 1) {
+		  FLAGS_block_size = n;
+		}
+		else if (sscanf(argv[i], "--open_files=%d%c", &n, &c) == 1) {
+		  FLAGS_open_files = n;
+		}
 	}
 	
 	leveldb::g_env=leveldb::Env::Default();
@@ -592,16 +670,16 @@ int main(int argc, char** argv)
 	// 指定 数据库文件所在目录
 	if(FLAGS_db==NULL)
 	{
-		//leveldb::g_env->GetTestDirectory(&default_db_path);
-		myGetTestDirectory(&default_db_path);
-		default_db_path+="/dbbench";
+		leveldb::g_env->GetTestDirectory(&default_db_path);
+		//myGetTestDirectory(&default_db_path);
+		default_db_path+="/mydbbench";
 		FLAGS_db=default_db_path.c_str();
 	}
 	fprintf(stderr, "FLAGS_db = %s\n", FLAGS_db);
 	
 	leveldb::Benchmark bm;
 	bm.Run();
-	//bm.Open();
+	
 	
 	return 0;
 }
