@@ -17,7 +17,7 @@
 #include<sys/time.h>
 
 
-static const char* FLAGS_benchmarks="WriteSeq";
+static const char* FLAGS_benchmarks="fillseq";
 static double FLAGS_compression_ratio=0.5;
 static int FLAGS_cache_size = -1;
 
@@ -56,6 +56,10 @@ static int FLAGS_block_size = 0;
 
 // Maximum number of files to keep open at the same time (use default if == 0)
 static int FLAGS_open_files = 0;
+
+// Print histogram of operation timings
+static bool FLAGS_histogram = false;
+
 
 
 namespace leveldb{
@@ -200,12 +204,12 @@ void ThreadState::Report()
 {
 	//time_t end=time(NULL);
 	uint64_t end=microSeconds();
-	uint64_t diff=end-start;
+	uint64_t diff=end-start;//微秒
 	fprintf(stdout, "microSeconds=%lld, ops=%ld, bytes=%d\n", diff, ops_, bytes);
 	double speed1=(end-start)/ops_;
 	
-	double speed2=bytes*1000000/1024/1024/diff;
-	fprintf(stdout, "%s		: 		%f micros/op; %f MB/s\n", name.c_str(), speed1, speed2);
+	double speed2=((bytes)/(1024*1024))/(diff/1000000);
+	fprintf(stdout, "%-12s	   :    %11.3f micros/op;   %6.1f MB/s\n", name.c_str(), speed1, speed2);
 } 
 
 
@@ -217,12 +221,14 @@ public:
 	int total;
 	int start_num;
 	int end_num;
+	bool start;
 	
 	SharedState(int t)
 	{
 		total=t;
 		start_num=0;
 		end_num=0;
+		start=false;
 		pthread_mutex_init(&mu, NULL);
 		pthread_cond_init(&cond, NULL);
 	}
@@ -394,17 +400,25 @@ private:
 		for(int i=0; i<nThreads; i++)
 			g_env->StartThread(ThreadBody, &arg);
 		
-		// 保证 所有线程退出，不用担心 线程引用 shared和arg.thread对象
+		
 		pthread_mutex_lock(&shared.mu);
+		
+		while(shared.start_num < nThreads)
+			pthread_cond_wait(&shared.cond, &shared.mu);
+		
+		shared.start=true;
+		pthread_cond_broadcast(&shared.cond);
+				
+		
 		
 		while(shared.end_num < nThreads)
 			pthread_cond_wait(&shared.cond, &shared.mu);
 		
-		
 		pthread_mutex_unlock(&shared.mu);
 		
 		
-		assert(shared.end_num == nThreads);		
+		assert(shared.end_num == nThreads);	
+		
 		arg.thread->Report(); 	
 		delete arg.thread;
 	}
@@ -415,17 +429,23 @@ private:
 		ThreadState* thread=arg->thread;
 		SharedState* shared=arg->shared;
 		
-		
+		pthread_mutex_lock(&shared->mu);
 		shared->start_num++;
+		if(shared->start_num >= shared->total)
+			pthread_cond_broadcast(&shared->cond);
+		while(shared->start==false)
+			pthread_cond_wait(&shared->cond, &shared->mu);
+		pthread_mutex_unlock(&shared->mu);
+			
 		
-		//void (*function)(ThreadState*)=arg->function;
-		//function(thread);
+
 		(arg->bm->*(arg->function))(thread);
+		
 		
 		pthread_mutex_lock(&shared->mu);
 		shared->end_num++;
-		if(shared->end_num==shared->total)
-			pthread_cond_signal(&shared->cond);
+		if(shared->end_num>=shared->total)
+			pthread_cond_broadcast(&shared->cond);
 		pthread_mutex_unlock(&shared->mu);
 	}
   
@@ -517,9 +537,9 @@ public:
 			int num_threads=FLAGS_threads;
 			void (Benchmark::*method)(ThreadState*)=NULL;
 			
-			if(name=="WriteSeq")
+			if(name=="fillseq")
 				method=&Benchmark::WriteSeq;
-			else if(name=="WriteRandom")
+			else if(name=="fillrandom")
 				method=&Benchmark::WriteRandom;
 			else if (name == "fillsync")
 			{
@@ -565,7 +585,8 @@ public:
 		options.max_open_files=FLAGS_open_files;
 		options.filter_policy= filter_policy_;
 		options.reuse_logs=FLAGS_reuse_logs; 
-				
+					
+ 						
 		Status s=DB::Open(options, FLAGS_db, &db_);
 		if(!s.ok())
 		{
@@ -662,6 +683,10 @@ int main(int argc, char** argv)
 		}
 		else if (sscanf(argv[i], "--open_files=%d%c", &n, &c) == 1) {
 		  FLAGS_open_files = n;
+		}
+		else if (sscanf(argv[i], "--histogram=%d%c", &n, &junk) == 1 &&
+               (n == 0 || n == 1)) {
+		  FLAGS_histogram = n;
 		}
 	}
 	
