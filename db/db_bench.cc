@@ -160,29 +160,51 @@ int64_t microSeconds()
 }
 
 
-class ThreadState{
+
+class Stats{
 private:
-	std::string name;
+	int64_t start_; // 微秒
+	int64_t finish_;
 	int next_report_;
 	int ops_;
-	int bytes;
-	//time_t start;
-	int64_t start; // 微秒
-	
+	int bytes_;
 	
 public:
-	ThreadState(std::string n):name(n),next_report_(10),ops_(0),bytes(0),start(microSeconds()) // epoch后的秒数
+	Stats()
 	{
-		
+		Start();
 	}
-	
-	void Update();
-	void hasWrite(int n)
-	{ bytes+=n; }
-	void Report();
+	void Start();
+	void Merge(const Stats& other);
+	void Stop()
+	{
+		finish_=microSeconds();
+	}
+	void FinishedSingleOp();
+	void AddBytes(int n)
+	{ bytes_+=n; }
+	void Report(const std::string& name);
+
 };
 
-void ThreadState::Update()
+void Stats::Start()
+{
+	start_=microSeconds();
+	finish_=start_;
+	next_report_=10;
+	ops_=0;
+	bytes_=0;
+}
+
+void Stats::Merge(const Stats& other)
+{
+	ops_+=other.ops_;
+	bytes_+=other.bytes_;
+	if(other.start_ < start_) start_=other.start_;
+	if(other.finish_ > finish_) finish_=other.finish_;
+}
+
+void Stats::FinishedSingleOp()
 {
 	ops_++;
 	if(ops_>=next_report_)
@@ -200,17 +222,31 @@ void ThreadState::Update()
 	}
 }
 
-void ThreadState::Report()
+void Stats::Report(const std::string& name)
 {
-	//time_t end=time(NULL);
-	uint64_t end=microSeconds();
-	uint64_t diff=end-start;//微秒
-	fprintf(stdout, "microSeconds=%lld, ops=%ld, bytes=%d\n", diff, ops_, bytes);
-	double speed1=(end-start)/ops_;
+	uint64_t elapsed=finish_-start_;//微秒
+	fprintf(stdout, "microSeconds=%lld, ops=%ld, bytes=%d\n", elapsed, ops_, bytes_);
+	double speed1=elapsed/ops_;
 	
-	double speed2=((bytes)/(1024*1024))/(diff/1000000);
+	double speed2=((bytes_)/(1024*1024))/(elapsed/1000000);
 	fprintf(stdout, "%-12s	   :    %11.3f micros/op;   %6.1f MB/s\n", name.c_str(), speed1, speed2);
 } 
+
+
+
+struct ThreadState{
+	//std::string name;
+	int tid;
+	Random rand; //不同线程有不同的Random
+	Stats stats;
+	
+	ThreadState(int index)
+		:tid(index),
+		rand(1000+index),
+		stats(Stats())
+	{}
+};
+
 
 
 
@@ -259,7 +295,7 @@ private:
 		
 	WriteOptions write_options_;
 	
-	Random rand;
+	//Random rand; 每个执行操作的线程拥有一个不同的Random
 	
 	
 	
@@ -267,7 +303,7 @@ private:
 		SharedState* shared;
 		ThreadState* thread;
 		Benchmark *bm;
-		void (Benchmark::*function)(ThreadState*);
+		void (Benchmark::*method)(ThreadState*);
 	};
 
 
@@ -353,14 +389,14 @@ private:
 			batch.Clear();
 			for(int j=0; j<entries_per_batch_; j++)
 			{
-				const int k= seq ? i+j : (rand.Next() % FLAGS_num);
+				const int k= seq ? i+j : (thread->rand.Next() % FLAGS_num);
 				char key[100];
 				snprintf(key, sizeof key, "%016d", k);
 				
 				batch.Put(key, gen.Generate(value_size_));
 				
 				nbytes+= strlen(key) + value_size_;
-				thread->Update();
+				thread->stats.FinishedSingleOp();
 			}
 											
 			s=db_->Write(write_options_, &batch);
@@ -372,7 +408,7 @@ private:
 			}
 		}
 		//int nbytes=num_*(sizeof key + value_size_);
-		thread->hasWrite(nbytes);
+		thread->stats.AddBytes(nbytes);
 	}
 	
 	/* void RunBenchmark(int nThreads, void (Benchmark::*method)())
@@ -389,16 +425,28 @@ private:
 	{
 		SharedState shared(nThreads);
 		
-		ThreadArg arg;
+		/*ThreadArg arg; 
 		arg.bm=this;
 		arg.shared=&shared;
 		arg.thread=new ThreadState(name);
 		//arg.thread.name=name;
-		arg.function=method;
-		
+		arg.method=method;
 		
 		for(int i=0; i<nThreads; i++)
 			g_env->StartThread(ThreadBody, &arg);
+		*/
+		
+		ThreadArg arg[nThreads];//为什么这里要创建数组？？
+//应为ThreadArg.ThreadState.Stats的bytes_、ops_等统计数据为int而非AtomicInt，不同线程不能不加锁访问
+		for(int i=0; i<nThreads; i++)
+		{
+			arg[i].bm=this;
+			arg[i].method=method;
+			arg[i].shared=&shared;
+			arg[i].thread=new ThreadState(i); // 因为每个线程一个ThreadState
+			g_env->StartThread(ThreadBody, &arg[i]);
+		}
+		
 		
 		
 		pthread_mutex_lock(&shared.mu);
@@ -416,11 +464,20 @@ private:
 		
 		pthread_mutex_unlock(&shared.mu);
 		
+			
+		/*arg.thread->stats.Report(name); 	
+		delete arg.thread;*/
 		
-		assert(shared.end_num == nThreads);	
+		for(int i=1; i<nThreads; i++)
+		{
+			arg[0].thread->stats.Merge(arg[i].thread->stats); //最后Merge所有的ThreadState
+		}
+		arg[0].thread->stats.Report(name);
 		
-		arg.thread->Report(); 	
-		delete arg.thread;
+		
+		for(int i=0; i<nThreads; i++)
+			delete arg[i].thread;
+		//delete[] arg;		
 	}
 	
 	static void ThreadBody(void *a)
@@ -438,8 +495,9 @@ private:
 		pthread_mutex_unlock(&shared->mu);
 			
 		
-
-		(arg->bm->*(arg->function))(thread);
+		thread->stats.Start();//计时更准确
+		(arg->bm->*(arg->method))(thread);
+		thread->stats.Stop();
 		
 		
 		pthread_mutex_lock(&shared->mu);
@@ -462,8 +520,7 @@ public:
 	value_size_(FLAGS_value_size),
 	entries_per_batch_(1),
 	num_(FLAGS_num),
-	write_options_(WriteOptions()),
-	rand(301)
+	write_options_(WriteOptions())
 	{
 		//删除已存在的数据库文件，删除数据库
 		std::vector<std::string> files;
@@ -684,7 +741,7 @@ int main(int argc, char** argv)
 		else if (sscanf(argv[i], "--open_files=%d%c", &n, &c) == 1) {
 		  FLAGS_open_files = n;
 		}
-		else if (sscanf(argv[i], "--histogram=%d%c", &n, &junk) == 1 &&
+		else if (sscanf(argv[i], "--histogram=%d%c", &n, &c) == 1 &&
                (n == 0 || n == 1)) {
 		  FLAGS_histogram = n;
 		}
