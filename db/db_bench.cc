@@ -10,11 +10,11 @@
 #include "leveldb/write_batch.h"
 #include "port/port.h"
 #include "util/crc32c.h"
-#include "util/histogram.h"
 #include "util/mutexlock.h"
 #include "util/random.h"
 #include "util/testutil.h"
 #include<sys/time.h>
+#include"histogram.h"
 
 
 static const char* FLAGS_benchmarks="fillseq";
@@ -168,6 +168,8 @@ private:
 	int next_report_;
 	int ops_;
 	int bytes_;
+	double last_op_finish_;
+	Histogram hist_;
 	
 public:
 	Stats()
@@ -194,10 +196,13 @@ void Stats::Start()
 	next_report_=10;
 	ops_=0;
 	bytes_=0;
+	last_op_finish_=start_;
+	hist_.Clear();
 }
 
 void Stats::Merge(const Stats& other)
 {
+	hist_.Merge(other.hist_);
 	ops_+=other.ops_;
 	bytes_+=other.bytes_;
 	if(other.start_ < start_) start_=other.start_;
@@ -206,6 +211,19 @@ void Stats::Merge(const Stats& other)
 
 void Stats::FinishedSingleOp()
 {
+	if(FLAGS_histogram)
+	{
+		double now=microSeconds();
+		double micros=now-last_op_finish_;
+		hist_.Add(micros);
+		if(micros > 20000)
+		{
+			fprintf(stderr, "long op: %.1f micros%30s\r", micros, "");
+			fflush(stderr);
+		}
+		last_op_finish_=now;
+	}
+	
 	ops_++;
 	if(ops_>=next_report_)
 	{	
@@ -230,6 +248,10 @@ void Stats::Report(const std::string& name)
 	
 	double speed2=((bytes_)/(1024*1024))/(elapsed/1000000);
 	fprintf(stdout, "%-12s	   :    %11.3f micros/op;   %6.1f MB/s\n", name.c_str(), speed1, speed2);
+	
+	if(FLAGS_histogram)
+		fprintf(stdout, "Microseconds per op: \n%s\n", hist_.ToString().c_str());
+	fflush(stdout);
 } 
 
 
