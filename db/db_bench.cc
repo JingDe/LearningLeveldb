@@ -24,6 +24,9 @@ static int FLAGS_cache_size = -1;
 // 写进 数据库 的总的key value 对数
 static int FLAGS_num=1000000; 
 
+// Number of read operations to do.  If negative, do FLAGS_num reads.
+static int FLAGS_reads = -1;
+
 // Size of each value
 static int FLAGS_value_size = 100;
 // Number of concurrent threads to run.
@@ -159,7 +162,13 @@ int64_t microSeconds()
 	return static_cast<uint64_t>(tm.tv_sec*1000000 + tm.tv_usec);
 }
 
-
+static void AppendWithSpace(std::string* str, Slice msg) {
+	if (msg.empty()) return;
+	if (!str->empty()) {
+		str->push_back(' ');
+	}
+	str->append(msg.data(), msg.size());
+}
 
 class Stats{
 private:
@@ -170,6 +179,7 @@ private:
 	int bytes_;
 	double last_op_finish_;
 	Histogram hist_;
+	std::string message_;
 	
 public:
 	Stats()
@@ -185,8 +195,11 @@ public:
 	void FinishedSingleOp();
 	void AddBytes(int n)
 	{ bytes_+=n; }
-	void Report(const std::string& name);
+	void Report(const Slice& name);
 
+	void AddMessage(Slice msg) {
+		AppendWithSpace(&message_, msg);
+	}
 };
 
 void Stats::Start()
@@ -240,14 +253,14 @@ void Stats::FinishedSingleOp()
 	}
 }
 
-void Stats::Report(const std::string& name)
+void Stats::Report(const Slice& name)
 {
 	uint64_t elapsed=finish_-start_;//微秒
 	fprintf(stdout, "microSeconds=%lld, ops=%ld, bytes=%d\n", elapsed, ops_, bytes_);
 	double speed1=elapsed/ops_;
 	
 	double speed2=((bytes_)/(1024*1024))/(elapsed/1000000);
-	fprintf(stdout, "%-12s	   :    %11.3f micros/op;   %6.1f MB/s\n", name.c_str(), speed1, speed2);
+	fprintf(stdout, "%-12s	   :    %11.3f micros/op;   %6.1f MB/s\n", name.ToString().c_str(), speed1, speed2);
 	
 	if(FLAGS_histogram)
 		fprintf(stdout, "Microseconds per op: \n%s\n", hist_.ToString().c_str());
@@ -316,6 +329,8 @@ private:
 	int num_;
 		
 	WriteOptions write_options_;
+	
+	int reads_;
 	
 	//Random rand; 每个执行操作的线程拥有一个不同的Random
 	
@@ -443,7 +458,7 @@ private:
 	} */
 
 	
-	void RunBenchmark(int nThreads, std::string name, void (Benchmark::*method)(ThreadState*))
+	void RunBenchmark(int nThreads, Slice name, void (Benchmark::*method)(ThreadState*))
 	{
 		SharedState shared(nThreads);
 		
@@ -529,7 +544,80 @@ private:
 		pthread_mutex_unlock(&shared->mu);
 	}
   
-  
+	void OpenBench(ThreadState* thread)
+	{
+		for(int i=0; i<num_; i++)
+		{
+			delete db_;
+			Open();
+			thread->stats.FinishedSingleOp();
+		}
+	}
+	
+	void ReadSequential(ThreadState* thread)
+	{
+		Iterator* iter=db_->NewInterator(ReadOptions());
+		int i=0;
+		int64_t bytes=0;
+		for(iter->SeekToFirst(); i<reads_  &&  iter->Valid(); iter->Next())
+		{
+			bytes+=iter->key().size() + iter->value().size();
+			thread->stats.FinishedSingleOp();
+			++i;
+		}
+		delete iter;
+		thread->stats.AddBytes(bytes);
+	}
+	
+	void ReadReverse(ThreadState* thread)
+	{
+		Iterator* iter=db_->NewInterator(ReadOptions());
+		int i=0;
+		int64_t bytes=0;
+		for(iter->SeekToFirst(); i<reads_  &&  iter->Valid(); iter->Prev())
+		{
+			bytes+=iter->key().size() + iter->value().size();
+			thread->stats.FinishedSingleOp();
+			++i;
+		}
+		delete iter;
+		thread->stats.AddBytes(bytes);
+	}
+	
+	void ReadRandom(ThreadState* thread)
+	{
+		ReadOptions options;
+		std::string value;
+		int found=0;
+		for(int i=0; i<reads_; i++)
+		{
+			char key[100];
+			const int k=thread->rand.Next() % FLAGS_num;
+			snprintf(key, sizeof(key), "%016d", k);
+			if(db_->Get(options, key, &value).ok())
+				found++;
+			thread->stats.FinishedSingleOp();
+		}
+		char msg[100];
+		snprintf(msg, sizeof msg, "(%d of %d found)", found, num_);
+		thread->stats.AddMessage(msg);
+	}
+	
+	void ReadMissing(ThreadState* thread) 
+	{
+		ReadOptions options;
+		std::string value;
+		for (int i = 0; i < reads_; i++) {
+		  char key[100];
+		  const int k = thread->rand.Next() % FLAGS_num;
+		  snprintf(key, sizeof(key), "%016d.", k);
+		  db_->Get(options, key, &value);
+		  thread->stats.FinishedSingleOp();
+		}
+	}
+	
+	
+	
   
 public:
 
@@ -542,7 +630,8 @@ public:
 	value_size_(FLAGS_value_size),
 	entries_per_batch_(1),
 	num_(FLAGS_num),
-	write_options_(WriteOptions())
+	write_options_(WriteOptions()),
+	reads_(FLAGS_reads<0 ? FLAGS_num : FLAGS_reads)
 	{
 		//删除已存在的数据库文件，删除数据库
 		std::vector<std::string> files;
@@ -589,52 +678,78 @@ public:
 	void Run()
 	{
 		PrintHeader();
-		
-		
+				
 		Open();
 		
 		const char *benchmarks=FLAGS_benchmarks;
 		const char* sep;
-		std::string name;
+		//std::string name;
+		Slice name;
 		while(benchmarks)
 		{
 			sep=strchr(benchmarks, ',');
 			if(sep==NULL)
 			{
-				name=benchmarks;
+				name=benchmarks;//Slice类拷贝赋值；构造临时变量，编译器生成的拷贝赋值函数
 				benchmarks=NULL;
 			}
 			else
-			{
-				
-				name=std::string(benchmarks, sep-benchmarks);
-				
+			{				
+				//name=std::string(benchmarks, sep-benchmarks);	
+				name=Slice(benchmarks, sep-benchmarks);//临时变量，赋值
 				benchmarks=sep+1;
 			}
 			
+			num_=FLAGS_num;
+			entries_per_batch_=1;	
+			value_size_=FLAGS_value_size;
+			reads_ = (FLAGS_reads < 0 ? FLAGS_num : FLAGS_reads);
 			
 			int num_threads=FLAGS_threads;
 			void (Benchmark::*method)(ThreadState*)=NULL;
 			
-			if(name=="fillseq")
+			if(name==Slice("open"))
+			{
+				method=&Benchmark::OpenBench;
+				num_/=10000;
+				if(num_<1) num_=1;
+			}
+			else if(name==Slice("fillseq"))
 				method=&Benchmark::WriteSeq;
-			else if(name=="fillrandom")
+			else if (name == "fillbatch") {
+				entries_per_batch_ = 1000;
+				method = &Benchmark::WriteSeq;
+			}
+			else if(name==Slice("fillrandom"))
 				method=&Benchmark::WriteRandom;
 			else if (name == "fillsync")
 			{
 				num_ /= 1000;
 				write_options_.sync = true;
 				method = &Benchmark::WriteRandom;
-			} else if (name == "fill100K")
+			} else if (name == Slice("fill100K"))
 			{
 				num_ /= 1000;
 				value_size_ = 100 * 1000;
 				method = &Benchmark::WriteRandom;
 			}
-			else if (name == "fillbatch") {
-				entries_per_batch_ = 1000;
-				method = &Benchmark::WriteSeq;
+			else if(name==Slice("readseq"))
+				method=&Benchmark::ReadSequential;
+			else if (name == Slice("readreverse")) {
+				method = &Benchmark::ReadReverse;
+		    }
+			else if (name == Slice("readrandom")) 
+				method = &Benchmark::ReadRandom;
+			else if (name == Slice("readrandomsmall")) {
+				reads_ /= 1000;
+				method = &Benchmark::ReadRandom;
 			}
+			else if (name == Slice("readmissing")) 
+				method = &Benchmark::ReadMissing;
+			else if (name == Slice("seekrandom")) {
+				method = &Benchmark::SeekRandom;
+			}
+			
 			
 			if(method)
 			{
@@ -766,6 +881,9 @@ int main(int argc, char** argv)
 		else if (sscanf(argv[i], "--histogram=%d%c", &n, &c) == 1 &&
                (n == 0 || n == 1)) {
 		  FLAGS_histogram = n;
+		}
+		else if (sscanf(argv[i], "--reads=%d%c", &n, &c) == 1) {
+		  FLAGS_reads = n;
 		}
 	}
 	
