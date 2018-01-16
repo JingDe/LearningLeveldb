@@ -15,9 +15,28 @@
 #include "util/testutil.h"
 #include<sys/time.h>
 #include"histogram.h"
+#include"atomic_pointer.h"
 
 
-static const char* FLAGS_benchmarks="fillseq";
+static const char* FLAGS_benchmarks="fillseq,"
+    "fillsync,"
+    "fillrandom,"
+    "overwrite,"
+    "readrandom,"
+    "readrandom,"  // Extra run to allow previous compactions to quiesce
+    "readseq,"
+    "readreverse,"
+    "compact,"
+    "readrandom,"
+    "readseq,"
+    "readreverse,"
+    "fill100K,"
+    "crc32c,"
+    "snappycomp,"
+    "snappyuncomp,"
+    "acquireload,"
+    ;
+	
 static double FLAGS_compression_ratio=0.5;
 static int FLAGS_cache_size = -1;
 
@@ -176,7 +195,7 @@ private:
 	int64_t finish_;
 	int next_report_;
 	int ops_;
-	int bytes_;
+	int64_t bytes_;
 	double last_op_finish_;
 	Histogram hist_;
 	std::string message_;
@@ -193,7 +212,7 @@ public:
 		finish_=microSeconds();
 	}
 	void FinishedSingleOp();
-	void AddBytes(int n)
+	void AddBytes(int64_t n)
 	{ bytes_+=n; }
 	void Report(const Slice& name);
 
@@ -206,7 +225,7 @@ void Stats::Start()
 {
 	start_=microSeconds();
 	finish_=start_;
-	next_report_=10;
+	next_report_=100;
 	ops_=0;
 	bytes_=0;
 	last_op_finish_=start_;
@@ -240,8 +259,7 @@ void Stats::FinishedSingleOp()
 	ops_++;
 	if(ops_>=next_report_)
 	{	
-		if      (next_report_ < 100)    next_report_ += 10;
-		else if (next_report_ < 1000)   next_report_ += 100;
+		if (next_report_ < 1000)        next_report_ += 100;
         else if (next_report_ < 5000)   next_report_ += 500;
         else if (next_report_ < 10000)  next_report_ += 1000;
         else if (next_report_ < 50000)  next_report_ += 5000;
@@ -255,32 +273,29 @@ void Stats::FinishedSingleOp()
 
 void Stats::Report(const Slice& name)
 {
-	uint64_t elapsed=finish_-start_;//微秒
-	fprintf(stdout, "microSeconds=%lld, ops=%ld, bytes=%d\n", elapsed, ops_, bytes_);
+	if(ops_<1)
+		ops_=1;
+	double elapsed=finish_-start_;//微秒
+	//fprintf(stdout, "microSeconds=%f, ops=%d, bytes=%d\n", elapsed, ops_, bytes_);
 	double speed1=elapsed/ops_;
 	
-	double speed2=((bytes_)/(1024*1024))/(elapsed/1000000);
-	fprintf(stdout, "%-12s	   :    %11.3f micros/op;   %6.1f MB/s\n", name.ToString().c_str(), speed1, speed2);
+	std::string extra;
+	if(bytes_>0)
+	{
+		//double speed2=((bytes_*1000000)/(1024*1024))/(elapsed);
+		char rate[100];
+		snprintf(rate, sizeof rate, "%6.1f MB/s", (bytes_*1000000/1048576.0)/elapsed);
+		extra=rate;
+	}
+	AppendWithSpace(&extra, message_);
+	
+	//fprintf(stdout, "%-12s  :  %11.3f micros/op;  %6.1f MB/s\n", name.ToString().c_str(), speed1, speed2);
+	fprintf(stdout, "%-12s  :  %11.3f micros/op;%s%s\n", name.ToString().c_str(), speed1, (extra.empty() ? "" : " "), extra.c_str());
 	
 	if(FLAGS_histogram)
 		fprintf(stdout, "Microseconds per op: \n%s\n", hist_.ToString().c_str());
 	fflush(stdout);
 } 
-
-
-
-struct ThreadState{
-	//std::string name;
-	int tid;
-	Random rand; //不同线程有不同的Random
-	Stats stats;
-	
-	ThreadState(int index)
-		:tid(index),
-		rand(1000+index),
-		stats(Stats())
-	{}
-};
 
 
 
@@ -290,15 +305,15 @@ public:
 	pthread_mutex_t mu;
 	pthread_cond_t cond;
 	int total;
-	int start_num;
-	int end_num;
+	int num_initialized;
+	int num_done;
 	bool start;
 	
 	SharedState(int t)
 	{
 		total=t;
-		start_num=0;
-		end_num=0;
+		num_initialized=0;
+		num_done=0;
 		start=false;
 		pthread_mutex_init(&mu, NULL);
 		pthread_cond_init(&cond, NULL);
@@ -309,6 +324,22 @@ public:
 		pthread_cond_destroy(&cond);
 	}
 };
+
+
+struct ThreadState{
+	//std::string name;
+	int tid;
+	Random rand; //不同线程有不同的Random
+	Stats stats;
+	SharedState* shared;
+	
+	ThreadState(int index)
+		:tid(index),
+		rand(1000+index),
+		stats(Stats())
+	{}
+};
+
 
 
 
@@ -331,7 +362,7 @@ private:
 	WriteOptions write_options_;
 	
 	int reads_;
-	
+	int heap_counter_;
 	//Random rand; 每个执行操作的线程拥有一个不同的Random
 	
 	
@@ -416,6 +447,12 @@ private:
 	
 	void DoWrite(ThreadState* thread, bool seq)
 	{
+		if (num_ != FLAGS_num) {
+		  char msg[100];
+		  snprintf(msg, sizeof(msg), "(%d ops)", num_);
+		  thread->stats.AddMessage(msg);
+		}
+	
 		WriteBatch batch;
 		RandomGenerator gen;  // 生成 随机 value
 		Status s;
@@ -488,7 +525,7 @@ private:
 		
 		pthread_mutex_lock(&shared.mu);
 		
-		while(shared.start_num < nThreads)
+		while(shared.num_initialized < nThreads)
 			pthread_cond_wait(&shared.cond, &shared.mu);
 		
 		shared.start=true;
@@ -496,7 +533,7 @@ private:
 				
 		
 		
-		while(shared.end_num < nThreads)
+		while(shared.num_done < nThreads)
 			pthread_cond_wait(&shared.cond, &shared.mu);
 		
 		pthread_mutex_unlock(&shared.mu);
@@ -524,8 +561,8 @@ private:
 		SharedState* shared=arg->shared;
 		
 		pthread_mutex_lock(&shared->mu);
-		shared->start_num++;
-		if(shared->start_num >= shared->total)
+		shared->num_initialized++;
+		if(shared->num_initialized >= shared->total)
 			pthread_cond_broadcast(&shared->cond);
 		while(shared->start==false)
 			pthread_cond_wait(&shared->cond, &shared->mu);
@@ -538,8 +575,8 @@ private:
 		
 		
 		pthread_mutex_lock(&shared->mu);
-		shared->end_num++;
-		if(shared->end_num>=shared->total)
+		shared->num_done++;
+		if(shared->num_done>=shared->total)
 			pthread_cond_broadcast(&shared->cond);
 		pthread_mutex_unlock(&shared->mu);
 	}
@@ -556,7 +593,7 @@ private:
 	
 	void ReadSequential(ThreadState* thread)
 	{
-		Iterator* iter=db_->NewInterator(ReadOptions());
+		Iterator* iter=db_->NewIterator(ReadOptions());
 		int i=0;
 		int64_t bytes=0;
 		for(iter->SeekToFirst(); i<reads_  &&  iter->Valid(); iter->Next())
@@ -571,7 +608,7 @@ private:
 	
 	void ReadReverse(ThreadState* thread)
 	{
-		Iterator* iter=db_->NewInterator(ReadOptions());
+		Iterator* iter=db_->NewIterator(ReadOptions());
 		int i=0;
 		int64_t bytes=0;
 		for(iter->SeekToFirst(); i<reads_  &&  iter->Valid(); iter->Prev())
@@ -616,7 +653,225 @@ private:
 		}
 	}
 	
+	void SeekRandom(ThreadState* thread)
+	{
+		ReadOptions options;
+		int found=0;
+		for(int i=0; i<reads_; i++)
+		{
+			Iterator* iter=db_->NewIterator(options);
+			char key[100];
+			const int k=thread->rand.Next() % FLAGS_num;
+			snprintf(key, sizeof key, "%016d", k);
+			iter->Seek(key);
+			if(iter->Valid()  &&  iter->key()==key)
+				found++;
+			delete iter;
+			thread->stats.FinishedSingleOp();
+		}
+		char msg[200];
+		snprintf(msg, sizeof(msg), "(%d of %d found)", found, num_);
+		thread->stats.AddMessage(msg);
+	}
 	
+	void ReadHot(ThreadState* thread)
+	{
+		ReadOptions options;
+		std::string value;
+		const int range=(FLAGS_num + 99)/100;
+		for(int i=0; i<reads_; i++)
+		{
+			char key[100];
+			const int k=thread->rand.Next() % range;
+			snprintf(key, sizeof key, "%016d", k);
+			db_->Get(options, key, &value);
+			thread->stats.FinishedSingleOp();
+		}
+	}
+	
+	
+	void DeleteSeq(ThreadState* thread) {
+		DoDelete(thread, true);
+	}
+
+	void DeleteRandom(ThreadState* thread) {
+		DoDelete(thread, false);
+	}
+	
+	void DoDelete(ThreadState* thread, bool seq)
+	{
+		RandomGenerator gen;
+		WriteBatch batch;
+		Status s;
+		for(int i=0; i<num_; i+=entries_per_batch_)
+		{
+			batch.Clear();
+			for(int j=0; j<entries_per_batch_; j++)
+			{
+				const int k=seq ? i+j  :  (thread->rand.Next()  % FLAGS_num);
+				char key[100];
+				snprintf(key, sizeof key, "%016d", k);
+				batch.Delete(key);
+				thread->stats.FinishedSingleOp();
+			}
+			s=db_->Write(write_options_, &batch);
+			if(!s.ok())
+			{
+				fprintf(stderr, "del error: %s\n", s.ToString().c_str());
+				exit(1);
+			}
+		}
+	}
+	
+	void ReadWhileWriting(ThreadState* thread)
+	{
+		if(thread->tid>0)
+		{
+			ReadRandom(thread);
+		}
+		else
+		{
+			RandomGenerator gen;
+			while(true)
+			{
+				{
+				pthread_mutex_lock(&thread->shared->mu);
+				if(thread->shared->num_done +1 >= thread->shared->num_initialized)
+					break;
+				pthread_mutex_unlock(&thread->shared->mu);
+				}
+				
+				const int k=thread->rand.Next() % FLAGS_num;
+				char key[100];
+				snprintf(key, sizeof key, "%016d", k);
+				Status s=db_->Put(write_options_, key, gen.Generate(value_size_));
+				if(!s.ok())
+				{
+					fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+					exit(1);
+				}
+			}
+			
+			thread->stats.Start();
+		}
+	}
+	
+	  void Compact(ThreadState* thread) {
+		db_->CompactRange(NULL, NULL);
+	  }
+	
+	  void Crc32c(ThreadState* thread) {
+		// Checksum about 500MB of data total
+		const int size = 4096;
+		const char* label = "(4K per op)";
+		std::string data(size, 'x');
+		int64_t bytes = 0;
+		uint32_t crc = 0;
+		while (bytes < 500 * 1048576) {
+		  crc = crc32c::Value(data.data(), size);
+		  thread->stats.FinishedSingleOp();
+		  bytes += size;
+		}
+		// Print so result is not dead
+		fprintf(stderr, "... crc=0x%x\r", static_cast<unsigned int>(crc));
+
+		thread->stats.AddBytes(bytes);
+		thread->stats.AddMessage(label);
+	  }
+	  
+	
+  void AcquireLoad(ThreadState* thread) {
+    int dummy;
+    LearningLeveldb::AtomicPointer ap(&dummy);
+    int count = 0;
+    void *ptr = NULL;
+    thread->stats.AddMessage("(each op is 1000 loads)");
+    while (count < 100000) {
+      for (int i = 0; i < 1000; i++) {
+        ptr = ap.Acquire_Load();
+      }
+      count++;
+      thread->stats.FinishedSingleOp();
+    }
+    if (ptr == NULL) exit(1); // Disable unused variable warning.
+  }
+  
+  
+  void SnappyCompress(ThreadState* thread) {
+    RandomGenerator gen;
+    Slice input = gen.Generate(Options().block_size);
+    int64_t bytes = 0;
+    int64_t produced = 0;
+    bool ok = true;
+    std::string compressed;
+    while (ok && bytes < 1024 * 1048576) {  // Compress 1G
+      ok = port::Snappy_Compress(input.data(), input.size(), &compressed);
+      produced += compressed.size();
+      bytes += input.size();
+      thread->stats.FinishedSingleOp();
+    }
+
+    if (!ok) {
+      thread->stats.AddMessage("(snappy failure)");
+    } else {
+      char buf[100];
+      snprintf(buf, sizeof(buf), "(output: %.1f%%)",
+               (produced * 100.0) / bytes);
+      thread->stats.AddMessage(buf);
+      thread->stats.AddBytes(bytes);
+    }
+  }
+
+  void SnappyUncompress(ThreadState* thread) {
+    RandomGenerator gen;
+    Slice input = gen.Generate(Options().block_size);
+    std::string compressed;
+    bool ok = port::Snappy_Compress(input.data(), input.size(), &compressed);
+    int64_t bytes = 0;
+    char* uncompressed = new char[input.size()];
+    while (ok && bytes < 1024 * 1048576) {  // Compress 1G
+      ok =  port::Snappy_Uncompress(compressed.data(), compressed.size(),
+                                    uncompressed);
+      bytes += input.size();
+      thread->stats.FinishedSingleOp();
+    }
+    delete[] uncompressed;
+
+    if (!ok) {
+      thread->stats.AddMessage("(snappy failure)");
+    } else {
+      thread->stats.AddBytes(bytes);
+    }
+  }
+
+    static void WriteToFile(void* arg, const char* buf, int n) {
+		reinterpret_cast<WritableFile*>(arg)->Append(Slice(buf, n));
+	  }
+  
+    void HeapProfile() {
+		char fname[100];
+		snprintf(fname, sizeof(fname), "%s/heap-%04d", FLAGS_db, ++heap_counter_);
+		WritableFile* file;
+		Status s = g_env->NewWritableFile(fname, &file);
+		if (!s.ok()) {
+		  fprintf(stderr, "%s\n", s.ToString().c_str());
+		  return;
+		}
+		bool ok = port::GetHeapProfile(WriteToFile, file);
+		delete file;
+		if (!ok) {
+		  fprintf(stderr, "heap profiling not supported\n");
+		  g_env->DeleteFile(fname);
+		}
+	  }
+  
+  void PrintStats(const char* key) {
+    std::string stats;
+    if (!db_->GetProperty(key, &stats)) {
+      stats = "(failed)";
+    }
+    fprintf(stdout, "\n%s\n", stats.c_str());
+  }
 	
   
 public:
@@ -631,7 +886,8 @@ public:
 	entries_per_batch_(1),
 	num_(FLAGS_num),
 	write_options_(WriteOptions()),
-	reads_(FLAGS_reads<0 ? FLAGS_num : FLAGS_reads)
+	reads_(FLAGS_reads<0 ? FLAGS_num : FLAGS_reads),
+	heap_counter_(0)
 	{
 		//删除已存在的数据库文件，删除数据库
 		std::vector<std::string> files;
@@ -683,7 +939,8 @@ public:
 		
 		const char *benchmarks=FLAGS_benchmarks;
 		const char* sep;
-		//std::string name;
+		bool fresh_db=false;
+		
 		Slice name;
 		while(benchmarks)
 		{
@@ -715,22 +972,35 @@ public:
 				if(num_<1) num_=1;
 			}
 			else if(name==Slice("fillseq"))
+			{
+				fresh_db=true;
 				method=&Benchmark::WriteSeq;
+			}
 			else if (name == "fillbatch") {
+				fresh_db=true;
 				entries_per_batch_ = 1000;
 				method = &Benchmark::WriteSeq;
 			}
 			else if(name==Slice("fillrandom"))
+			{
+				fresh_db=true;
 				method=&Benchmark::WriteRandom;
+			}
 			else if (name == "fillsync")
 			{
+				fresh_db=true;
 				num_ /= 1000;
 				write_options_.sync = true;
 				method = &Benchmark::WriteRandom;
 			} else if (name == Slice("fill100K"))
 			{
+				fresh_db=true;
 				num_ /= 1000;
 				value_size_ = 100 * 1000;
+				method = &Benchmark::WriteRandom;
+			}
+			else if (name == Slice("overwrite")) {
+				fresh_db = false;
 				method = &Benchmark::WriteRandom;
 			}
 			else if(name==Slice("readseq"))
@@ -748,6 +1018,66 @@ public:
 				method = &Benchmark::ReadMissing;
 			else if (name == Slice("seekrandom")) {
 				method = &Benchmark::SeekRandom;
+			}
+			else if (name == Slice("readhot")) {
+				method = &Benchmark::ReadHot;
+		    }
+			else if (name == Slice("deleteseq")) {
+				method = &Benchmark::DeleteSeq;
+		    }
+			else if (name == Slice("deleterandom")) {
+				method = &Benchmark::DeleteRandom;
+		    }
+			else if (name == Slice("readwhilewriting")) {
+				num_threads++;  // Add extra thread for writing
+				method = &Benchmark::ReadWhileWriting;
+			}
+			else if (name == Slice("compact")) {
+				method = &Benchmark::Compact;
+			}else if (name == Slice("crc32c")) {
+				method = &Benchmark::Crc32c;
+			}
+			else if (name == Slice("acquireload")) {
+				method = &Benchmark::AcquireLoad;
+			}
+			else if (name == Slice("snappycomp")) {
+				method = &Benchmark::SnappyCompress;
+		    } else if (name == Slice("snappyuncomp")) {
+				method = &Benchmark::SnappyUncompress;
+		    }
+			else if (name == Slice("heapprofile")) {
+				HeapProfile();
+			}else if (name == Slice("stats")) {
+				PrintStats("leveldb.stats");
+			} else if (name == Slice("sstables")) {
+				PrintStats("leveldb.sstables");
+			}
+			else if (name == Slice("num-files-at-level0")) {
+				PrintStats("leveldb.sstables");
+			}
+			else if (name == Slice("approximate-memory-usage")) {
+				PrintStats("leveldb.approximate-memory-usage");
+			}
+			else {
+				if (name != Slice()) {  // No error message for empty name
+				  fprintf(stderr, "unknown benchmark '%s'\n", name.ToString().c_str());
+				}
+			}
+			
+			if(fresh_db)
+			{
+				if(FLAGS_use_existing_db)
+				{
+					fprintf(stdout, "%-12s : skipped (--use_existing_db is true)\n", name.ToString().c_str());
+					method = NULL;
+				}
+				else
+				{
+					delete db_;
+					  db_ = NULL;
+					  DestroyDB(FLAGS_db, Options());
+					  Open();
+				}
 			}
 			
 			
