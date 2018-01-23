@@ -18,7 +18,8 @@
 #include"atomic_pointer.h"
 
 
-static const char* FLAGS_benchmarks="fillseq,"
+static const char* FLAGS_benchmarks=
+	"fillseq,"
     "fillsync,"
     "fillrandom,"
     "overwrite,"
@@ -86,8 +87,8 @@ static bool FLAGS_histogram = false;
 
 namespace leveldb{
 
-
-Env* g_env = NULL;
+namespace{
+leveldb::Env* g_env = NULL;
 
 
 
@@ -103,6 +104,7 @@ Slice RandomString(Random* rnd, int len, std::string* dst)
 	}
 	return Slice(*dst);
 }
+
 
 
 
@@ -125,22 +127,6 @@ Slice CompressibleString(Random *rnd, double compressed_fraction, size_t len, st
 	dst->resize(len);
 	return Slice(*dst);
 }
-
-
-#if defined(__linux)
-static Slice TrimSpace(Slice s) {
-  size_t start = 0;
-  while (start < s.size() && isspace(s[start])) {
-    start++;
-  }
-  size_t limit = s.size();
-  while (limit > start && isspace(s[limit-1])) {
-    limit--;
-  }
-  return Slice(s.data() + start, limit - start);
-}
-#endif
-
 
 
 // 类RandomGenerator作用：
@@ -174,12 +160,23 @@ public:
 };
 
 
-int64_t microSeconds()
-{
-	struct timeval tm;
-	gettimeofday(&tm, NULL);
-	return static_cast<uint64_t>(tm.tv_sec*1000000 + tm.tv_usec);
+
+
+
+#if defined(__linux)
+static Slice TrimSpace(Slice s) {
+  size_t start = 0;
+  while (start < s.size() && isspace(s[start])) {
+    start++;
+  }
+  size_t limit = s.size();
+  while (limit > start && isspace(s[limit-1])) {
+    limit--;
+  }
+  return Slice(s.data() + start, limit - start);
 }
+#endif
+
 
 static void AppendWithSpace(std::string* str, Slice msg) {
 	if (msg.empty()) return;
@@ -188,6 +185,18 @@ static void AppendWithSpace(std::string* str, Slice msg) {
 	}
 	str->append(msg.data(), msg.size());
 }
+
+
+
+
+
+int64_t microSeconds()
+{
+	struct timeval tm;
+	gettimeofday(&tm, NULL);
+	return static_cast<uint64_t>(tm.tv_sec*1000000 + tm.tv_usec);
+}
+
 
 class Stats{
 private:
@@ -342,7 +351,7 @@ struct ThreadState{
 
 
 
-
+}
 
 
 
@@ -363,8 +372,7 @@ private:
 	
 	int reads_;
 	int heap_counter_;
-	//Random rand; 每个执行操作的线程拥有一个不同的Random
-	
+		
 	
 	
 	struct ThreadArg{
@@ -443,7 +451,16 @@ private:
 
   }
   
-  
+  	void WriteSeq(ThreadState* thread)
+	{
+		DoWrite(thread, true);
+	}
+	
+	void WriteRandom(ThreadState* thread)
+	{
+		DoWrite(thread, false);
+	}
+	
 	
 	void DoWrite(ThreadState* thread, bool seq)
 	{
@@ -498,7 +515,10 @@ private:
 	void RunBenchmark(int nThreads, Slice name, void (Benchmark::*method)(ThreadState*))
 	{
 		SharedState shared(nThreads);
-		
+		shared.total = nThreads;
+		shared.num_initialized = 0;
+		shared.num_done = 0;
+		shared.start = false;
 		/*ThreadArg arg; 
 		arg.bm=this;
 		arg.shared=&shared;
@@ -556,7 +576,7 @@ private:
 	
 	static void ThreadBody(void *a)
 	{
-		ThreadArg* arg=static_cast<ThreadArg*>(a);
+		ThreadArg* arg=reinterpret_cast<ThreadArg*>(a);
 		ThreadState* thread=arg->thread;
 		SharedState* shared=arg->shared;
 		
@@ -873,6 +893,11 @@ private:
     fprintf(stdout, "\n%s\n", stats.c_str());
   }
 	
+	
+	
+
+	
+
   
 public:
 
@@ -895,7 +920,8 @@ public:
 		MyGetChildren(FLAGS_db, &files);
 		for(size_t i=0; i<files.size(); i++)
 		{
-			if(strcmp(files[i].c_str(), "heap-")==0)
+			//if(strcmp(files[i].c_str(), "heap-")==0)
+			if (Slice(files[i]).starts_with("heap-"))
 				MyDeleteFile(std::string(FLAGS_db)+"/"+files[i]);
 				//g_env->DeleteFile(std::string(FLAGS_db) + "/" +files[i]);
 		}
@@ -939,7 +965,7 @@ public:
 		
 		const char *benchmarks=FLAGS_benchmarks;
 		const char* sep;
-		bool fresh_db=false;
+		
 		
 		Slice name;
 		while(benchmarks)
@@ -961,9 +987,11 @@ public:
 			entries_per_batch_=1;	
 			value_size_=FLAGS_value_size;
 			reads_ = (FLAGS_reads < 0 ? FLAGS_num : FLAGS_reads);
+			write_options_ = WriteOptions();
 			
 			int num_threads=FLAGS_threads;
 			void (Benchmark::*method)(ThreadState*)=NULL;
+			bool fresh_db=false;
 			
 			if(name==Slice("open"))
 			{
@@ -1120,18 +1148,6 @@ public:
 	}
 
 
-	void WriteSeq(ThreadState* thread)
-	{
-		DoWrite(thread, true);
-	}
-	
-	void WriteRandom(ThreadState* thread)
-	{
-		DoWrite(thread, false);
-	}
-	
-	
-
 
 };
 
@@ -1152,16 +1168,18 @@ int main(int argc, char** argv)
   
 	std::string  default_db_path;
 	
-	for(int i=0; i<argc; i++)
+	for(int i=1; i<argc; i++)
 	{
+		double d;
 		int n;
 		char c;
 		/* if(std::string(argv[i])=="--benchmarks"  &&  i<argc-1)
 		{
 			FLAGS_benchmarks=argv[i+1];
 		} */
-		//if(std::string(argv[i]).starts_with("--benchmarks="))
-		if(memcmp(argv[i], "--benchmarks=", strlen("--benchmarks="))==0)
+		
+		//if(memcmp(argv[i], "--benchmarks=", strlen("--benchmarks="))==0)
+		if (leveldb::Slice(argv[i]).starts_with("--benchmarks="))
 		{
 			FLAGS_benchmarks=argv[i]+strlen("--benchmarks=");
 		} 
@@ -1169,9 +1187,9 @@ int main(int argc, char** argv)
 		{
 			FLAGS_cache_size=n;
 		}
-		else if(sscanf(argv[i], "--compression_ratio=%d%s", &n, &c)==1)
+		else if(sscanf(argv[i], "--compression_ratio=%d%s", &d, &c)==1)
 		{
-			FLAGS_compression_ratio=n;
+			FLAGS_compression_ratio=d;
 		}
 		else if(sscanf(argv[i], "--num=%d%s", &n, &c)==1)
 		{
@@ -1214,6 +1232,10 @@ int main(int argc, char** argv)
 		}
 		else if (sscanf(argv[i], "--reads=%d%c", &n, &c) == 1) {
 		  FLAGS_reads = n;
+		}
+		else {
+		  fprintf(stderr, "Invalid flag '%s'\n", argv[i]);
+		  exit(1);
 		}
 	}
 	
