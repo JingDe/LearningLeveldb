@@ -139,15 +139,45 @@ void SkipList::deleteNode(int key)
 	}
 }
 
+/* 另种写法
+void* SkipList::getData(int key)
+{
+	Node* curr=head;
+	for(int i=MAX_LEVEL-1; i>=0; i--)
+	{
+		if(curr->next_nodes[i]==tail  ||  curr->next_nodes[i]->key>key)
+			continue;
+		else
+		{
+			while(curr->next_nodes[i]!=tail  &&  curr->next_nodes[i]->key<key)
+				curr=curr->next_nodes[i];
+			if(curr->next_nodes[i] !=tail  &&  curr->next_nodes[i]->key==key)
+				return curr->next_nodes[i]->data;
+		}
+	}
+	return nullptr;
+}
+*/
+
 void *SkipList::getData(int key)
 {
-	Node* curr=head->next_nodes[0];
-	while(curr!=tail  &&  curr->key!=key)
-		curr=curr->next_nodes[0];
-	if(curr!=tail  &&  curr->key==key)
-		return curr->data;
-	return NULL;
+	Node* x=head;
+	for(int i=MAX_LEVEL-1; i>=0; i--)
+	{
+		Node* curr=x->next_nodes[i];
+		while(curr!=tail  &&  curr->key<key)
+		{
+			x=curr;
+			curr=curr->next_nodes[i];
+		}
+		
+		if(curr!=tail  &&  curr->key==key)
+			return curr->data;
+	}
+	return nullptr;
 }
+
+
 
 void SkipList::displayList()
 {
