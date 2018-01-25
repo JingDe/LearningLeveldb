@@ -1,7 +1,6 @@
 #ifndef ATOMIC_POINTER_H
 #define ATOMIC_POINTER_H
 
-#include"stdio.h"
 
 namespace LearningLeveldb{
 
@@ -20,9 +19,7 @@ class AtomicPointer {
  public:
   AtomicPointer() { }
   explicit AtomicPointer(void* p) : rep_(p) 
-  { 
-	//fprintf(stdout, "AtomicPointer(): LEVELDB_HAVE_MEMORY_BARRIER\n"); 
-  }
+  {}
   inline void* NoBarrier_Load() const { return rep_; }
   inline void NoBarrier_Store(void* v) { rep_ = v; }
   inline void* Acquire_Load() const {
