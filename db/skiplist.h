@@ -1,5 +1,5 @@
-#ifndef SKIPLIST_H
-#define SKIPLIST_H
+#ifndef LEARNING_LEVELDB_SKIPLIST_H
+#define LEARNING_LEVELDB_SKIPLIST_H
 
 
 #include <assert.h>

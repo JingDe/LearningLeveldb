@@ -1,5 +1,5 @@
 
-//#include "testharness.h"
+#include "testharness.h"
 
 #include <string>
 #include <stdlib.h>
