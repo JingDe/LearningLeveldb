@@ -45,6 +45,14 @@ public:
 		return access(fname.c_str(), F_OK);
 	}
 	
+	virtual Status RenameFile(const std::string& src, const std::string& target)
+	{
+		Status result;
+		if(rename(src.c_str(), target.c_str()) !=0)
+			result=PosixError(src, errno);
+		return result;
+	}
+	
 	virtual Status LockFile(const std::string& fname, FileLock** lock)
 	{
 		*lock=NULL;
@@ -77,6 +85,34 @@ public:
 	virtual void Schedule(void (*function)(void*), void* arg);
 
 	virtual void StartThread(void (*function)(void* arg), void* arg);
+	
+	/*pid_t gettid()
+	{
+	  return static_cast<pid_t>(syscall(SYS_gettid));
+	}*/
+	
+	static uint64_t gettid()
+	{
+		pthread_t tid=pthread_self();
+		uint64_t thread_id=0;
+		memcpy(&thread_id, &tid, std::min(sizeof(thread_id), sizeof(tid)));
+		return thread_id;
+	}
+	
+	virtual Status NewLogger(const std::string& fname, Logger** result)
+	{
+		FILE* f=fopen(fname.c_str(), "w");
+		if(f==NULL)
+		{
+			*result=NULL;
+			return PosixError(fname, errno);
+		}
+		else
+		{
+			*result=new PosixLogger(f, &PosixEnv::gettid);
+			return Status::OK();
+		}
+	}
 	
 private:
 	void PthreadCall(const char* label, int result)
@@ -166,6 +202,16 @@ static int LockOrUnlock(int fd, bool ok)
 	f.l_len=0;
 	return fcntl(fd, F_SETLK, &f);
 }
+
+class Logger{
+public:
+	Logger() {}
+	virtual ~Logger();
+
+private:
+	Logger(const Logger&);
+	void operator=(const Logger&);
+};
 
 
 class PosixFileLock: public FileLock{

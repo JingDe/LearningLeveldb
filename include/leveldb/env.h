@@ -59,10 +59,7 @@ void MyDeleteFile(std::string file)
 	}
 }
 
-pid_t gettid()
-{
-  return static_cast<pid_t>(syscall(SYS_gettid));
-}
+
 
 } // namespace learningleveldb
 
