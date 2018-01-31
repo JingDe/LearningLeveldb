@@ -1,8 +1,8 @@
 
 // Env
 
-#ifndef ENV_H
-#define ENV_H
+#ifndef LEARNINGLEVELDB_ENV_H_
+#define LEARNINGLEVELDB_ENV_H_
 
 #include<cstdio>
 #include<vector>
@@ -15,6 +15,8 @@
 #include<unistd.h>
 #include<sys/syscall.h>
 
+
+namespace learningleveldb{
 /*
 struct dirent{
 	ino_t d_ino; //inode序号
@@ -62,4 +64,25 @@ pid_t gettid()
   return static_cast<pid_t>(syscall(SYS_gettid));
 }
 
+} // namespace learningleveldb
+
+namespace leveldb{
+	
+class FileLock;
+
+class Env{
+	
+	
+};
+	
+class FileLock{
+public:
+	FileLock() {}
+	virtual ~FileLock();
+private:
+	FileLock(const FileLock&);
+	void operator=(const FileLock&);
+};
+
+}
 #endif

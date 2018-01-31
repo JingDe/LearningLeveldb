@@ -1,3 +1,28 @@
+#include "leveldb/env.h"
+
+namespace leveldb{
+
+namespace{
+	
+static Status PosixError(const std::string& context, int er_number)
+{
+	if(err_number==ENOENT)
+		return Status::NotFound(context, strerror(err_number));
+	else
+		return Status::IOError(context, strerror(err_number));
+}
+
+class PosixLockTable{
+private:
+	port::Mutex mu_;
+	std::set<std::string> locked_files_;
+public:
+	bool Insert(const std::string& fname)
+	{
+		MutexLock l(&mu_);
+		return locked_files_.insert(fname).second;
+	}
+};
 
 class PosixEnv: public Env{
 public:
@@ -5,6 +30,48 @@ public:
 	virtual ~PosixEnv()
 	{
 		
+	}
+	
+	virtual Status CreateDir(const std::string& name)
+	{
+		Status result;
+		if(mkdir(name.c_str(), 0755) !=0)
+			result=PosixError(name, errno);
+		return result;
+	}
+	
+	virtual bool FileExists(const std::string& fname)
+	{
+		return access(fname.c_str(), F_OK);
+	}
+	
+	virtual Status LockFile(const std::string& fname, FileLock** lock)
+	{
+		*lock=NULL;
+		Status result;
+		int fd=open(fname.c_str(), O_RDWR  |  O_CREAT, 0644);
+		if(fd<0)
+		{
+			result=PosixError(fname, errno);
+		}
+		else if(!locks_.Insert(fname))
+		{
+			close(fd);
+			result=Status::IOError("lock"+fname, "already held by process");
+		}
+		else if(LockOrUnlock(fd, true)==-1)
+		{
+			result=PosixError("lock "+fname, errno);
+			close(fd);
+			locks_.Remove(fname);
+		}
+		else
+		{
+			PosixFileLock* my_lock=new PosixFileLock;
+			my_lock->fd_=fd;
+			my_lock->name_=fname;
+			*lock=my_lock;
+		}		
 	}
 	
 	virtual void Schedule(void (*function)(void*), void* arg);
@@ -36,6 +103,8 @@ private:
 	struct BGItem { void* arg; void (*function)(void*); };
 	typedef std::deque<BGItem> BGQueue;
 	BGQueue queue_;
+	
+	PosixLockTable locks_;
 };
 
 
@@ -82,4 +151,45 @@ void PosixEnv::StartThread(void (*function)(), void * arg)
 	state->user_function=function;
 	state->arg=arg;
 	PthreadCall("start thread", pthread_create(&t, NULL, &StartThreadWrapper, state));
+}
+
+
+
+static int LockOrUnlock(int fd, bool ok)
+{
+	errno=0;
+	struct flock f;
+	memset(&f, 0, sizeof(f));
+	f.l_type = (lock ? F_WRLCK  :  F_UNLCK);
+	f.l_whence=SEEK_SET;
+	f.l_start=0;
+	f.l_len=0;
+	return fcntl(fd, F_SETLK, &f);
+}
+
+
+class PosixFileLock: public FileLock{
+public:
+	int fd_;
+	std::string name_;
+};
+
+} // namespace
+
+
+static pthread_once_t once=PTHREAD_ONCE_INIT;
+static Env* default_env;
+static void InitDefaultEnv()
+{
+	default_env=new PosixEnv;
+}
+
+Env* Env::Default()
+{
+	pthread_once(&once, InitDefaultEnv);
+	return default_env;
+}
+
+
+
 }
