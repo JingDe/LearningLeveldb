@@ -57,6 +57,13 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
 	options_(SantizeOptions(dbname, &internal_comparator_, &internal_filter_policy_, raw_options)),
 	
 
+Status DBImpl::NewDB()
+{
+	VersionEdit new_db;
+	new_db.SetComparatorName(user_comparator()->Name());
+	
+}
+	
 Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest)
 {
 	mutex_.AssertHeld(); // 已加锁
@@ -71,9 +78,17 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest)
 	{
 		if(options_.create_if_missing)
 		{
-			
+			s=NewDB();
+			if(!s.ok())
+				return s;
+		}
+		else
+		{
+			return Status::InvalidArgument(dbname_, "does not nexit (create_if_missing is false)");
 		}
 	}
+	else
+		
 }
 
 }
