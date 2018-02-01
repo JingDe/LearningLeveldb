@@ -68,9 +68,23 @@ namespace leveldb{
 class FileLock;
 
 class Env{
+public:
+	Env() {}
+	virtual ~Env();
 	
-	
+	virtual Status NewWritableFile(const std::string& fname, WritableFile** result) =0;
 };
+
+class WritableFile{
+public:
+	WritableFile() {}
+	virtual ~WritableFile();
+	
+private:
+	WritableFile(const WritableFile&);
+	void operator=(const WritableFile&);
+};
+
 	
 class FileLock{
 public:

@@ -4,6 +4,7 @@ namespace leveldb{
 
 namespace{
 	
+
 static Status PosixError(const std::string& context, int er_number)
 {
 	if(err_number==ENOENT)
@@ -11,6 +12,34 @@ static Status PosixError(const std::string& context, int er_number)
 	else
 		return Status::IOError(context, strerror(err_number));
 }
+
+class PosixWritableFile : public WritableFile{
+private:
+	std::string filename_;
+	int fd_;
+	char buf_[kBufSize];
+	size_t pos_;
+
+public:
+	PosixWritableFile(const std::string& fname, int fd)
+		:filename_(fname), fd_(fd), pos_(0) {}
+	~PosixWritableFile()
+	{
+		if(fd_ >=0)
+			Close();
+	}
+	
+	virtual Status Close()
+	{
+		Status result=FlushBuffered();
+		const int r=close(fd_);
+		if(r<0  &&  result.ok())
+			result=PosixError(filename_, errno);
+		fd_=-1;
+		return result;
+	}
+};
+
 
 class PosixLockTable{
 private:
@@ -38,6 +67,22 @@ public:
 		if(mkdir(name.c_str(), 0755) !=0)
 			result=PosixError(name, errno);
 		return result;
+	}
+	
+	virtual Status NewWritableFile(const std::string& fname, WritableFile** result)
+	{
+		Status s;
+		int fd=open(fname.c_str(), 0_TRUNC | O_WRONLY | O_CREAT, 0644);
+		if(fd<0)
+		{
+			*result=NULL;
+			s=PosixError(fname, errno);
+		}
+		else
+		{
+			*result=new PosixWritableFile(fname, fd);
+		}
+		return s;
 	}
 	
 	virtual bool FileExists(const std::string& fname)

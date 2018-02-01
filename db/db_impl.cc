@@ -61,7 +61,23 @@ Status DBImpl::NewDB()
 {
 	VersionEdit new_db;
 	new_db.SetComparatorName(user_comparator()->Name());
+	new_db.SetLogNumber(0);
+	new_db.SetNextFile(2);
+	new_db.SetLastSequence(0);
 	
+	const std::string manifest=DescriptorFileName(dbname_, 1);
+	WritableFile* file;
+	Status s=env_->NewWritableFile(manifest, &file);
+	if(!s.ok())
+		return s;
+	
+	{
+		log::writer log(file);
+		std::string record;
+		new_db.EncodeTo(&record);
+		
+		
+	}
 }
 	
 Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest)

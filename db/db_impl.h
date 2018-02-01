@@ -12,4 +12,9 @@ private:
 	FileLock* db_lock_;
 	
 	port::Mutex mutex_;
+	
+	const Comparator* user_comparator() const
+	{
+		return internal_comparator_.user_comparator();
+	}
 };
