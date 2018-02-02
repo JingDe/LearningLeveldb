@@ -12,5 +12,8 @@ enum RecordType{
 };
 static const int kMaxRecordType=kLastType;
 
+// 4字节checksum, 2字节length，1字节type
+static const int kHeaderSize = 4+2+1;
+
 }
 }

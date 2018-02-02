@@ -7,6 +7,8 @@ class Writer{
 public:
 	explicit Writer(WritableFile* dest);
 	
+	Status AddRecord(const Slice& slice);
+	
 private:
 	WritableFile* dest_;
 	int block_offset_;

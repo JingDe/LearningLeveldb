@@ -3,6 +3,14 @@ namespace leveldb{
 
 enum Tag{
 	kComparator = 1,
+	kLogNumber            = 2,
+	kNextFileNumber       = 3,
+	kLastSequence         = 4,
+	kCompactPointer       = 5,
+	kDeletedFile          = 6,
+	kNewFile              = 7,
+	// 8 was used for large value refs
+	kPrevLogNumber        = 9
 };
 
 void VersionEdit::Clear()
@@ -26,7 +34,52 @@ void VersionEdit::Encode(std::string* dst) const
 	if(has_comparator_)
 	{
 		PutVarint32(dst, kComparator);
-		
+		PutLengthPrefixedSlice(dst, comparator_);
+	}
+	if(has_log_number_)
+	{
+		PutVarint32(dst, kLogNumber);
+		PutVarint64(dst, log_number_);
+	}
+	if(has_prev_log_number_)
+	{
+		PutVarint32(dst, kPrevLogNumber);
+		PutVarint64(dst, prev_log_number_);
+	}
+	if(has_next_file_number_)
+	{
+		PutVarint32(dst, kNextFileNumber);
+		PutVarint64(dst, next_file_number_);
+	}
+	if(has_last_sequence_)
+	{
+		PutVarint32(dst, kLastSequence);
+		PutVarint64(dst, last_sequence_);
+	}
+	
+	for(size_t i=0; i<compact_pointers_.size(); i++)
+	{
+		PutVarint32(dst, kCompactPointer);
+		PutVarint32(dst, compact_pointers_[i].first);
+		PutLengthPrefixedSlice(dst, compact_pointers_[i].second.Encode());
+	}
+	
+	for(DeletedFileSet::const_iterator iter=deleted_files_.begin(); iter != deleted_files_.end(); ++iter)
+	{
+		PutVarint32(dst, kDeletedFile);
+		PutVarint32(dst, iter->first);
+		PutVarint64(dst, iter->second);
+	}
+	
+	for(size_t i=0; i<new_files_.size(); i++)
+	{
+		const FileMetaData& f=new_files_[i].second;
+		PutVarint32(dst, kNewFile);
+		PutVarint32(dst, new_files_[i].first);
+		PutVarint32(dst, f.number);
+		PutVarint32(dst, f.file_size);
+		PutLengthPrefixedSlice(dst, f.smallest.Encode());
+		PutLengthPrefixedSlice(dst, f.largest.Encode());
 	}
 }
 

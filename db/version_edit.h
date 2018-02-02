@@ -1,4 +1,15 @@
 
+strutct FileMetaData{
+	int refs;
+	int allowed_seeks; // compaction前允许的seek次数
+	uint64_t number;
+	uint64_t file_size; // 文件字节数
+	InternalKey smallest; // 表中的最小key
+	InternalKey largest; // 
+	
+	FileMetaData() : refs(0), allowed_seeks(1 << 30), file_size(0) {}
+};
+
 class VersionEdit{
 
 public:
@@ -45,6 +56,7 @@ private:
 	bool has_next_file_number_;
 	bool has_last_sequence_;
 	
+	std::vector<std::pair<int, InternalKey> > compact_pointers_;
 	DeletedFileSet deleted_files;
 	std::vector<std::pair<int, FileMetaData> > new_files_;
 };

@@ -11,7 +11,7 @@ char* EncodeVarint32(char* dst, uint32_t v) {
     *(ptr++) = v;
     std::cout<<"1: "<<v<<std::endl;
     //std::cout<<*(ptr-1)<<std::endl;
-    std::cout<<static_cast<int>(*(ptr-1))<<std::endl;
+    std::cout<<static_cast<int>(*(ptr-1))<<std::endl;   
   } else if (v < (1<<14)) {
     *(ptr++) = v | B;
     *(ptr++) = v>>7;
@@ -55,6 +55,8 @@ void test(int v)
 int main()
 {
 	test( (1<<7)-1 );
+	int x=0b001011110111111; //0010 1111 0111 111 b
+	test(x);
 	test( (1<<14)-1 );
 	test( (1<<21)-1 );
 	test( (1<<28)-1 );

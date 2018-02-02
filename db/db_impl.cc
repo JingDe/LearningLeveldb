@@ -75,9 +75,15 @@ Status DBImpl::NewDB()
 		log::writer log(file);
 		std::string record;
 		new_db.EncodeTo(&record);
-		
-		
+		s=log.AddRecord(record);
+		if(s.ok())
+			s=file->Close();
 	}
+	delete file;
+	if(s.ok())
+		s=SetCurrentFile(env_, dbname_, 1);
+	else
+		env_->
 }
 	
 Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest)

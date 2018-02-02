@@ -29,14 +29,69 @@ public:
 			Close();
 	}
 	
+	virtual Status Append(const Slice& data)
+	{
+		size_t n=data.size();
+		const char* p=data.data();
+		
+		size_t copy=std::min(n, kBufSize-pos_);
+		memcpy(buf_ + pos_, p, copy);
+		p += copy;
+		n -= copy;
+		pos_ += copy;
+		if(n==0)
+			return Status::OK();
+		
+		Status s=FlushBuffered();
+		if(!s.ok())
+			return s;
+		
+		if(n<kBufSize) // 剩余字节少，延迟写文件，先写到buf_
+		{
+			memcpy(buf_, p, n);
+			pos_=n;
+			return Status::OK();
+		}
+		return WriteRaw(p, n); // 直接写文件
+	}
+
+	virtual Status Flush(){
+		return FlushBuffered();
+	}
+	
 	virtual Status Close()
 	{
 		Status result=FlushBuffered();
 		const int r=close(fd_);
 		if(r<0  &&  result.ok())
 			result=PosixError(filename_, errno);
-		fd_=-1;
+		fd=-1;
 		return result;
+	}
+	
+private:
+	Status FlushBuffered()
+	{
+		Status s=WriteRaw(buf_, pos_);
+		pos_=0;
+		return s;
+	}
+	
+	Status WriteRaw(const char* p, size_t n)
+	{
+		while(n >0)
+		{
+			ssize_t r=write(fd_, p, n);
+			if(r <0)
+			{
+				if(errno == EINTR)
+					continue;
+				return PosixError(filename_, errno);
+			}
+			p += r;
+			n -= r;
+		}
+		return Status::OK();
 	}
 };
 

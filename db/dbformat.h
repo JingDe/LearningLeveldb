@@ -13,4 +13,16 @@ public:
 	}
 };
 
+class InternalKey{
+private:
+	std::string rep_;
+	
+public:
+	Slice Encode() const
+	{
+		assert(!rep_.empty());
+		return rep_;
+	}
+};
+
 }
