@@ -96,6 +96,10 @@ private:
 };
 
 
+class PosixSequentialFile: public SequentialFile {
+};
+
+
 class PosixLockTable{
 private:
 	port::Mutex mu_;
@@ -139,6 +143,27 @@ public:
 		}
 		return s;
 	}
+	
+	  virtual Status NewSequentialFile(const std::string& fname,
+                                   SequentialFile** result) {
+		int fd = open(fname.c_str(), O_RDONLY);
+		if (fd < 0) {
+		  *result = NULL;
+		  return PosixError(fname, errno);
+		} else {
+		  *result = new PosixSequentialFile(fname, fd);
+		  return Status::OK();
+		}
+	  }
+	
+	virtual Status DeleteFile(const std::string& fname)
+	{
+		Status result;
+		if(unlink(fname.c_str()) !=0)
+			result=PosixError(fname, errno);
+		return result;
+	}
+	
 	
 	virtual bool FileExists(const std::string& fname)
 	{

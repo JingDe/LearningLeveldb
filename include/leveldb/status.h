@@ -20,6 +20,10 @@ public:
 		return Status(kInvalidArgument, msg, msg2);
 	}
 	
+	static Status Corruption(const Slice& msg, const Slice& msg2 = Slice()) {
+		return Status(kCorruption, msg, msg2);
+	}
+	
 private:
   // OK status has a NULL state_.  Otherwise, state_ is a new[] array
   // of the following form:

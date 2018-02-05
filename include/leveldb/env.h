@@ -15,8 +15,6 @@
 #include<unistd.h>
 #include<sys/syscall.h>
 
-
-namespace learningleveldb{
 /*
 struct dirent{
 	ino_t d_ino; //inode序号
@@ -25,7 +23,9 @@ struct dirent{
 	unsigned char d_type; //文件类型，块设备、字符设备、目录、命名管道、符号链接、普通文件、UNIX域套接字
 	char d_name[256]; //文件名
 };
-*/
+*//*
+namespace learningleveldb{
+
 
 
 //dir是完整路径名，获得目录下所有文件名到files中
@@ -62,6 +62,7 @@ void MyDeleteFile(std::string file)
 
 
 } // namespace learningleveldb
+*/
 
 namespace leveldb{
 	
@@ -73,6 +74,9 @@ public:
 	virtual ~Env();
 	
 	virtual Status NewWritableFile(const std::string& fname, WritableFile** result) =0;
+	
+	virtual Status NewSequentialFile(const std::string& fname,
+                                   SequentialFile** result) = 0;
 };
 
 class WritableFile{

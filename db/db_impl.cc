@@ -55,6 +55,11 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
 	internal_comparator_(raw_options.comparator),
 	internal_filter_policy_(raw_options.filter_policy_),
 	options_(SantizeOptions(dbname, &internal_comparator_, &internal_filter_policy_, raw_options)),
+	dbname_(dbname)
+{
+	
+	versions_ = new VersionSet(dbname_, &options_, table_cache_, &internal_comparator_);
+}
 	
 
 Status DBImpl::NewDB()
@@ -65,7 +70,7 @@ Status DBImpl::NewDB()
 	new_db.SetNextFile(2);
 	new_db.SetLastSequence(0);
 	
-	const std::string manifest=DescriptorFileName(dbname_, 1);
+	const std::string manifest=DescriptorFileName(dbname_, 1); // dbname_/MANIFEST-000001
 	WritableFile* file;
 	Status s=env_->NewWritableFile(manifest, &file);
 	if(!s.ok())
@@ -75,15 +80,16 @@ Status DBImpl::NewDB()
 		log::writer log(file);
 		std::string record;
 		new_db.EncodeTo(&record);
-		s=log.AddRecord(record);
+		s=log.AddRecord(record); // VersionEdit编码成字符串写进 dbname_/MANIFEST-000001
 		if(s.ok())
 			s=file->Close();
 	}
 	delete file;
 	if(s.ok())
-		s=SetCurrentFile(env_, dbname_, 1);
+		s=SetCurrentFile(env_, dbname_, 1); // 创建dbname_/CURRENT 写有 dbname_/MANIFEST-000001
 	else
-		env_->
+		env_->DeleteFile(manifest);
+	return s;
 }
 	
 Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest)
@@ -110,7 +116,14 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest)
 		}
 	}
 	else
-		
+	{
+		if(options_.error_if_exits)
+		{
+			return Status::InvalidArgument(dbname_, "exits (error_if_exits is true)");
+		}
+	}
+	
+	s=versions_->Recover(save_manifest); // 根据当前数据库文件恢复
 }
 
 }
