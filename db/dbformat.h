@@ -23,6 +23,10 @@ public:
 		assert(!rep_.empty());
 		return rep_;
 	}
+	void DecodeFrom(const Slice& s)
+	{
+		rep_.assign(s.data(), s.size());
+	}
 };
 
 }

@@ -19,7 +19,7 @@ Writer::Writer(WritableFile* dest)
 	InitTypeCrc(type_crc_);
 }
 
-// 将字符串slice写到记录文件，控制每次写不超过kBlockSize
+// 将字符串slice写到记录文件，将slice分片写，控制每次写不超过kBlockSize
 Status Writer::AddRecord(const Slice& slice)
 {
 	const char* ptr=slice.data();
@@ -65,6 +65,7 @@ Status Writer::AddRecord(const Slice& slice)
 }
 
 // 写类型t的从ptr开始的n字节,写到物理文件dest_中
+// 4字节checksum, 2字节length，1字节RecordType，数据
 Status Writer::EmitPhysicalRecord(RecordType t, const char* ptr, size_t n)
 {
 	assert( n<=0xffff); // 保证长度可以写到两个字节里

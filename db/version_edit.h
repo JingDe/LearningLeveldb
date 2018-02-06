@@ -41,6 +41,8 @@ public:
 	
 	void EncodeTo(std::string* dst) const;
 	
+	Status DecodeFrom(const Slice& src);
+	
 private:
 
 	typedef std::set<std::pair<int, uint64_t> > DeletedFileSet;

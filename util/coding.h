@@ -1,6 +1,8 @@
 
 extern void PutVarint32(std::string* dst, uint32_t value);
 
+extern bool GetLengthPrefixedSlice(Slice* input, Slice* result);
+
 extern const char* GetVarint32PtrFallback(const char* p, const char* limit, uint32_t* value);
 
 // 从字符串p-limit解码获得value

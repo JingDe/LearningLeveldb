@@ -97,6 +97,17 @@ private:
 
 
 class PosixSequentialFile: public SequentialFile {
+private:
+	std::string filename_;
+	int fd_;
+	
+public:
+	virtual Status Skip(uint64_t n)
+	{
+		if(lseek(fd_, n, SEEK_CUR) == static_cast<off_t>(-1))
+			return PosixError(filename_, errno);
+		return Status::OK();
+	}
 };
 
 

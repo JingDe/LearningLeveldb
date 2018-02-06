@@ -9,6 +9,7 @@ class Version {
 	
 	int refs_; // 指向这个Version的引用
 	
+	std::vector<FileMetaData*> files_[config::kNumLevels]; // 每层的文件列表
 	 
 	FileMetaData* file_to_compact_; // 将compact的文件
 	int file_to_compact_level_;
