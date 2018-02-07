@@ -1,4 +1,14 @@
 
+static double MaxBytesForLevel(const Options* options, int level)
+{
+	double result= 10. * 1048576.0;
+	while(level > 1)
+	{
+		result *=10;
+		level --;
+	}
+	return result;
+}
 
 void Version::Unref()
 {
@@ -17,7 +27,7 @@ VersionSet::VersionSet(const std::string& dbname, const Options* options, TableC
       table_cache_(table_cache),
       icmp_(*cmp),
       next_file_number_(2),
-      manifest_file_number_(0),  // Filled by Recover()
+      manifest_file_number_(0),  // 从Recover()获得
       last_sequence_(0),
       log_number_(0),
       prev_log_number_(0),
@@ -116,22 +126,59 @@ public:
 		cmp.internal_comparator=&vset_->icmp_;
 		for(int level=0; level<config::kNumLevels; level++)
 		{
-			// 将added files加入已存在的文件，丢掉删除的文件，将结果存到v中
+		// 将added files加入已存在的文件，插入过程中忽略删除的文件，将结果存到v中
+			// 归并顺序插入两个文件数组
 			const std::vector<FileMetaData*>& base_files=base_->files_[level];
 			std::vector<FileMetaData*>::const_iterator base_iter=base_files.begin();
 			std::vector<FileMetaData*>::const_iterator base_end=base_files.end();
 			const FileSet* added=levels_[level].added_files;
 			v->files_[level].reserve(base_files.size() + added->size());
+			// 将 added 每一个FileSet* 添加到base_files中
 			for(FileSet::const_iterator added_iter=added->size(); added_iter!=added->end(); ++added_iter)
 			{
-				for(std::vector<FileMetaData*>::const_iterator bpos=std::upper_bound(base_iter, base_end, *added_iter, cmp); 
-					base_iter != bpos; ++base_iter)
+				// 将 base_files 中每一个小于 此次added元素 的文件先插入
+				std::vector<FileMetaData*>::const_iterator bpos=std::upper_bound(base_iter, base_end, *added_iter, cmp);
+				for(; base_iter != bpos; ++base_iter)
 				{
-					
+					MaybeAddFile(v, level, *base_iter);
 				}
+				// 后插入added的一个文件
+				MaybeAddFile(v, level, *added_iter);
 			}
 			
+				// 插入base_files中剩下的文件
+			for(; base_iter != base_end; ++base_iter)
+				MaybeAddFile(v. level, *base_iter);
+			
 			// 
+			if(level>0)
+			{
+				for(uint32_t i=1; i< v->files_[level].size(); i++)
+				{
+					const InternalKey& prev_end=v->files_[level][i-1]->largest;
+					const InternalKey& this_begin=v->files_[level][i]->smallest;
+					if(vset_->icmp_.Compare(prev_end, this_begin) >=0)
+					{
+						fprintf(stderr, "overlapping ranges in same level %s vs. %s\n", prev_end.DebugString().c_str(), this_begin.DebugString().c_str());
+						abort();
+					}
+				}
+			}
+		}
+	}
+	
+	// 在Version中插入第level层的文件f，从小到大插入，保证不overlap
+	void MaybeAddFile(Version* v, int level, FileMetaData* f)
+	{
+		if(levels_[level].deleted_files.count(f->number) >0)
+		{}
+		else
+		{
+			std::vector<FileMetaData*>* files=&v->files_[level];
+			if(level >0  &&  !files->empty())
+				assert(vset_->icmp_.Compare((*files)[files->size()-1]->largest, f->smallest) < 0);
+			f->refs++;
+			files->push_back(f);
 		}
 	}
 };
@@ -224,7 +271,7 @@ Status VersionSet::Recover(bool *save_manifest)
 	if(s.ok())
 	{
 		if(!have_next_file)
-			s=Status::Corruption("no meta-nextfile entry in descriptor");
+		{	s=Status::Corruption("no meta-nextfile entry in descriptor");
 		} else if (!have_log_number) {
 		  s = Status::Corruption("no meta-lognumber entry in descriptor");
 		} else if (!have_last_sequence) {
@@ -237,13 +284,24 @@ Status VersionSet::Recover(bool *save_manifest)
 		MarkFileNumberUsed(prev_log_number);
 		MarkFileNumberUsed(log_number);
 	}
-	
 	if(s.ok())
 	{
 		Version* v=new Version(this);
 		builder.SaveTo(v);
 		
-		Finalize(v);
+		// 安装新创建的version
+		Finalize(v); 
+		AppendVersion(v);
+		manifest_file_number_=next_file;
+		next_file_number_=next_file+1;
+		last_sequence_=last_sequence;
+		log_number_=log_number;
+		prev_log_number_=prev_log_number;
+		
+		if(ReuseManifest(dscname, current))
+		{}
+		else
+			*save
 	}
 }
 
@@ -251,4 +309,37 @@ void VersionSet::MarkFileNumberUsed(uint64_t number)
 {
 	if(next_file_number_ <= number)
 		next_file_number_=number+1;
+}
+
+void VersionSet::Finalize(Version* v) // 计算下一次compaction的层
+{
+	int best_level=-1;
+	double best_score=-1;
+	
+	for(int level=0; level<config::kNumLevels-1; level++)
+	{
+		double score;
+		if(level==0)
+		{
+			// 特殊对待第0层，以文件个数而不是字节数为标准：
+			// 第一，写缓存较大，不需要多做0层的compaction
+			// 第二，每次read时0层的文件都被合并，所以希望当单个文件大小较小（
+			// 可能设置较小的写缓冲、高压缩比、较多的overwrite或deletion）时避免过多的文件
+			score=v->files_[level].size() / static_cast<double>(config::kL0_CompactionTrigger);
+		}
+		else
+		{
+			const uint64_t level_bytes=TotalFileSize(v->files_[level]);
+			score=static_cast<double>(level_bytes) / MaxBytesForLevel(options_, level);
+		}
+		
+		if(score > best_score)
+		{
+			best_level=level;
+			best_score=score;
+		}
+	}
+	
+	v->compaction_level_=best_level;
+	v->compaction_score_=best_score;
 }
