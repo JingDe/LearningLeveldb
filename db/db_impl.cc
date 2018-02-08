@@ -14,7 +14,7 @@ static void ClipToRange(T* ptr, V minvalue, V maxvalue)
 		*ptr=minvalue;
 }
 
-Options SantizeOptions(const string& dbname, const InternalKeyComparator* icmp, const InternalFilterPolicy* ipolicy, const Options& src)
+Options SanitizeOptions(const string& dbname, const InternalKeyComparator* icmp, const InternalFilterPolicy* ipolicy, const Options& src)
 {
 	Options result=src;
 	result.comparator=icmp;
@@ -27,7 +27,7 @@ Options SantizeOptions(const string& dbname, const InternalKeyComparator* icmp, 
 	{
 		src.env->CreateDir(dbname);
 		src.env->RenameFile(InfoLogFileName(dbname), OldInfoLogFileName(dbname));
-		Status s=src.env->NewLogger(InfoLogFileName(dbname), &result.info_log);
+		Status s=src.env->NewLogger(InfoLogFileName(dbname), &result.info_log); // dbname/LOG文件
 		if(!s.ok())
 			result.info_log=NULL;
 	}
@@ -54,7 +54,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
 	:env_(raw_options.env),
 	internal_comparator_(raw_options.comparator),
 	internal_filter_policy_(raw_options.filter_policy_),
-	options_(SantizeOptions(dbname, &internal_comparator_, &internal_filter_policy_, raw_options)),
+	options_(SanitizeOptions(dbname, &internal_comparator_, &internal_filter_policy_, raw_options)),
 	dbname_(dbname)
 {
 	
@@ -123,7 +123,126 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest)
 		}
 	}
 	
-	s=versions_->Recover(save_manifest); // 根据当前数据库文件恢复
+	s=versions_->Recover(save_manifest); // 根据当前数据库文件恢复，并判断是否需要保存当前的manifest
+	if(!s.ok())
+		return s;
+	SequenceNumber max_sequence(0);
+	
+	// 恢复所有比descriptor即MANIFEST文件中新的log文件(.log文件)
+	// 这些文件可能是先前的数据库化身创建的，但没有注册到descriptor中
+	const uint64_t min_log=versions_->LogNumber();
+	const uint64_t prev_log=versions_->PrevLogNumber();
+	std::vector<std::string> filenames;
+	s=env_->GetChildren(dbname_, &filenames); // 数据库目录下所有文件
+	if(!s.ok())
+		return s;
+	std::set<uint64_t> expected;
+	versions_->AddLiveFiles(&expected); // VersionSet 所有Version记录的文件 （的序号）
+	uint64_t number;
+	FileType type;
+	std::vector<uint64_t> logs;
+	for(size_t i=0; i< filenames.size(); i++)
+	{
+		if(ParseFileName(filenames[i], &number, &type))
+		{
+			expected.erase(number);
+			if(type==kLogFile  &&  ((number >= min_log)  ||  (number==prev_log) ))
+				logs.push_back(number); 
+		}
+	}
+	if(!expected.empty()) // VersionSet 记录的文件中有丢失
+	{
+		char buf[50];
+		snprintf(buf, sizeof(buf), "%d missing files; e.g.", static_cast<int>(expected.size()));
+		return Status::Corruption(buf, TableFileName(dbname_, *(expected.begin()))); // .ldb文件
+	}
+	
+	std::sort(logs.begin(), logs.end()); // 所有 .log文件的序号
+	for(size_t i=0; i<logs.size(); i++)
+	{
+		s=RecoverLogFile(logs[i], (i==logs.size()-1), save_manifest, edit, &max_sequence);
+		if(!s.ok())
+			return s;
+		// 先前的数据库化身可能在分配log序号后没有写MANIFEST记录，在VersionSet中手动更新文件序号分配计数
+		//versions_->MarkFileNumberUsed(logs[i]);
+	}
+	
+	
+}
+
+Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log, bool* save_manifest, 
+		VersionEdit* eidt, SequenceNumber* max_sequence)
+{
+	struct LogReporter: public log::Reader::Reporter{
+		Env* env;
+		Logger* info_log;
+		const char* fname;
+		Status* status;
+		virtual void Corruption(size_t bytes, const Status& s)
+		{
+			Log(info_log, "%s%s: dropping %d bytes; %s", (this->status==NULL  ?  "(ignoring error) " : ""),
+					fname, static_cast<int>(bytes), s.ToString().c_str());
+		}
+	};
+	
+	mutex_.AssertHeld();
+	
+	std::string fname=LogFileName(dbname_, log_number); // .log文件
+	SequencitalFile* file;
+	Status status=env_->NewSequentialFile(fname, &file);
+	if(!status.ok())
+	{
+		MaybeIgnoreError(&status);
+		return status;
+	}
+	
+	LogReporter reporter;
+	reporter.env=env_;
+	reporter.info_log=options_.info_log;
+	reporter.fname=fname.c_str();
+	reporter.status=(options_.paranoid_checks ? &status : NULL);
+	
+	log::Reader reader(file, &reporter, true/*checksum*/, 0/*initial_offset*/);
+	Log(options_.info_log, "Recovering log #%llu", (unsigned long long) log_number);
+	
+	std::string scratch;
+	Slice record;
+	WriteBatch batch;
+	int compactions=0;
+	MemTable* mem=NULL;
+	while(reader.ReadRecord(&record, &scratch)  &&  status.ok())
+	{
+		if(record.size()<12)
+		{
+			reporter.Corruption(record.size(), Status::Corruption("log record too small"));
+			continue;
+		}
+		WriteBatchInternal::SetContents(&batch, record);
+		
+		if(mem==NULL)
+		{
+			mem=new MemTable(internal_comparator_);
+			mem->Ref();
+		}
+		status=WriteBatchInternal::InsertInto(&batch, mem);
+		//MaybeIgnoreError(&status);
+		if(!status.ok())
+			break;
+		
+	}
+}
+
+void DBImpl::MaybeIgnoreError(Status* s) const
+{
+	if(s.ok()  ||  options_.paranoid_checks)
+	{
+		
+	}
+	else
+	{
+		Log(options_.info_log, "Ignoring error %s", s->ToString().c_str());
+		*s=Status::OK();
+	}
 }
 
 }

@@ -299,9 +299,59 @@ Status VersionSet::Recover(bool *save_manifest)
 		prev_log_number_=prev_log_number;
 		
 		if(ReuseManifest(dscname, current))
-		{}
+		{
+			// 可以使用存在的MANIFEST文件，不需要保存新的
+		}
 		else
 			*save
+	}
+}
+
+// 不能重用MANIFEST的原因有：
+// 文件名格式不对， MANIFEST-000001
+// 文件太大
+// 创建WritableFile失败
+bool VersionSet::ReuseManifest(const std::string& dscname, const std::string& dscbase)
+{
+	if(!options_->resuse_logs)
+		return false;
+	FileType manifest_type;
+	uint64_t manifest_number;
+	uint64_t manifest_size;
+	if(!ParseFileName(dscbase, &manifest_number, &manifest_type)  ||
+		manifest_type != kDescriptorFile  ||
+		!env_->GetFileSize(dscname, &manifest_size).ok()  ||
+		manifest_size >= TargetFileSize(options_)) // MANIFEST文件超出最大文件大小
+	{
+		return false;
+	}
+	
+	assert(descriptor_file_ ==NULL);
+	assert(descriptor_log_ ==NULL);
+	Status r=env_->NewAppendableFile(dscname, &descriptor_file_);
+	if(!r.ok())
+	{
+		Log(options_->info_log, "Reuse MANIFEST: %s\n", r.ToString().c_str());
+		assert(descriptor_file_==NULL);
+		return false;
+	}
+	
+	Log(options_->info_log, "Reusing MANIFEST %s\n", dscname.c_str());
+	descriptor_log_=new log::Writer(descriptor_file_, manifest_size);
+	return true;
+}
+
+// 获得 所有Version 的所有文件序号
+void VersionSet::AddLiveFiles(std::set<uint64_t>* live)
+{
+	for(Version* v=dummy_versions_.next_; v!=&dummy_versions_; v=v->next_)
+	{
+		for(int level=0; level<config::kNumLevels; level++)
+		{
+			const std::vector<FileMetaData*>& files = v->files_[level];
+			for(size_t i=0; i<files.size(); i++)
+				live->insert(files[i]->number);
+		}
 	}
 }
 
