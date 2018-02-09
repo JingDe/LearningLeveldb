@@ -5,6 +5,12 @@ class MemTable{
 	
 	void Ref() { ++refs_; }
 	
+	
+	void Add(SequenceNumber seq, ValueType type,
+           const Slice& key,
+           const Slice& value);
+		   
+private:
 
 	struct KeyComparator{
 		const InternalKeyComparator comparator;

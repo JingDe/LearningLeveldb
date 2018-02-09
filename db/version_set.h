@@ -32,6 +32,8 @@ public:
 	
 	Status Recover(bool *save_manifest); // 从文件中恢复最近保存的 descriptor
 	
+	uint64_t NewFileNumber() { return next_file_number_++; }
+	
 private:
 	class Builder;
 	

@@ -25,12 +25,27 @@ SequenceNumber WriteBatchInternal::Sequence(const WriteBatch* b)
 	return SequenceNumber(DecodeFixed64(b->rep_.data()));
 }
 
+int WriteBatchInternal::Count(const WriteBatch* b) {
+	return DecodeFixed32(b->rep_.data() + 8);
+}
+
 namespace{
 
 class MemTableInserter: public WriteBatch::Handler{
 public:
 	SequenceNumber sequence_; // uint64_t 
 	MemTable* mem_;
+	
+	virtual void Put(const Slice& key, const Slice& value)
+	{
+		mem_->Add(sequence_, kTypeValue, key, value);
+		sequence_++;
+	}
+	virtual void Delete(const Slice& key)
+	{
+		mem_->Add(sequence_, kTypeDeletion, key, Slice());
+		sequence_++;
+	}
 };
 
 }
@@ -43,7 +58,7 @@ Status WriteBatchInternal::InsertInto(const WriteBatch* b, MemTable* memtable)
 	return b->Iterate(&inserter);
 }
 
-// 将 rep_插入到handler.mem_中
+// 将 rep_ 插入到 handler.mem_中
 Status WriteBatch::Iterate(Handler* handler) const
 {
 	Slice input(rep_);

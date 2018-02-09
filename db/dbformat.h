@@ -3,6 +3,14 @@ namespace leveldb{
 	
 typedef uint64_t SequenceNumber;
 
+static const SequenceNumber kMaxSequenceNumber = ((0x1ull << 56) -1);
+
+inline Slice ExtractUserKey(const Slice& internal_key)
+{
+	assert(internal_key.size() >= 8);
+	return Slice(internal_key.data(), internal_key.size()-8);
+}
+
 class InternalKeyComparator: public Comparator{
 private:
 	const Comparator* user_comparator;

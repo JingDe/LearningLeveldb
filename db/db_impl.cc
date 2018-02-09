@@ -171,7 +171,7 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest)
 }
 
 Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log, bool* save_manifest, 
-		VersionEdit* eidt, SequenceNumber* max_sequence)
+		VersionEdit* edit, SequenceNumber* max_sequence)
 {
 	struct LogReporter: public log::Reader::Reporter{
 		Env* env;
@@ -224,11 +224,23 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log, bool* save_man
 			mem=new MemTable(internal_comparator_);
 			mem->Ref();
 		}
-		status=WriteBatchInternal::InsertInto(&batch, mem);
-		//MaybeIgnoreError(&status);
+		status=WriteBatchInternal::InsertInto(&batch, mem); // 从记录中恢复MemTable
+		MaybeIgnoreError(&status);
 		if(!status.ok())
 			break;
+		// writebatch头有8字节sequence号+4字节count
+		const SequenceNumber last_seq=WriteBatchInternal::Sequence(&batch) + WriteBatchInternal::Count(&batch) -1;
+		if(last_seq > *max_sequence)
+			*max_sequence = last_seq;
 		
+		// 当0层的memtable较大时，需要保存当前的manifest，将0层数据写进sstable
+		if(mem->ApproximateMemoryUsage() > options_.write_buffer_size)
+		{
+			compactions++;
+			*save_manifest=true;
+			status=WriteLevel0Table(mem, edit, NULL);
+			
+		}
 	}
 }
 
@@ -243,6 +255,26 @@ void DBImpl::MaybeIgnoreError(Status* s) const
 		Log(options_.info_log, "Ignoring error %s", s->ToString().c_str());
 		*s=Status::OK();
 	}
+}
+
+Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base)
+{
+	mutex_.AssertHeld();
+	const uint64_t start_micros=env_->NowMicros();
+	FileMetaData meta;
+	meta.number=versions_->NewFileNumber(); 
+	pending_outputs_.insert(meta.number);
+	Iterator* iter=mem->NewIterator();
+	Log(options_.info_log, "Level-0 table #%llu: started", (unsigned long long) meta.number);
+	
+	Status s;
+	{
+		mutex_.Unlock();
+		s=BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
+		mutex_.Lock();
+	}
+	
+	
 }
 
 }
