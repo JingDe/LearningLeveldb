@@ -59,6 +59,38 @@ public:
 		return FlushBuffered();
 	}
 	
+	Status SyncDirIfManifest()
+	{
+		const char* f=filename_.c_str();
+		const char* sep=strrchr(f, '/');
+		Slice basename;
+		std::string dir;
+		if(sep == NULL)
+		{
+			dir=".";
+			basename=f;
+		}
+		else
+		{
+			dir=std::string(f, sep-f);
+			basename = sep +1;
+		}
+		Status s;
+		if(basename.starts_with("MANIFEST"))
+		{
+			int fd=open(dir.c_str(), O_RDONLLY);
+			if(fd < 0)
+				s=PosixError(dir, errno);
+			else
+			{
+				if(fsync(fd)<0) // 刷新文件所在目录
+					s=PosixError(dir, errno);
+				close(fd);
+			}
+		}
+		return s;
+	}
+	
 	virtual Status Close()
 	{
 		Status result=FlushBuffered();
@@ -67,6 +99,21 @@ public:
 			result=PosixError(filename_, errno);
 		fd=-1;
 		return result;
+	}
+	
+	virtual Status Sync()
+	{
+		// 如果是manifest文件，确保manifest表示的新文件存在filesystem中
+		Status s=SyncDirIfManifest();
+		if(!s.ok())
+			return s;
+		s=FlushBuffered();
+		if(s.ok())
+		{
+			if(fdatasync(fd_) !=0)
+				s=PosixError(filename_, errno);
+		}
+		return s;
 	}
 	
 private:

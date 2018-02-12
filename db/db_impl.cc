@@ -274,7 +274,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base)
 		mutex_.Lock();
 	}
 	
-	
+
 }
 
 }
