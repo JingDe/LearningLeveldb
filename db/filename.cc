@@ -113,4 +113,10 @@ std::string TableFileName(const std::string& name, uint64_t number)
 	return MakeFileName(name, number, "ldb");
 }
 
+std::string SSTTableFileName(const std::string& name, uint64_t number) 
+{
+	assert(number > 0);
+	return MakeFileName(name, number, "sst");
+}
+
 }

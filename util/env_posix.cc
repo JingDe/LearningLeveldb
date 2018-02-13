@@ -3,7 +3,53 @@
 namespace leveldb{
 
 namespace{
+
+class Limiter{
+public:
+	Limiter(intptr_t n)
+	{
+		SetAllowed(n);
+	}
 	
+	// 如果可以获得另一个资源，获取并返回true，否则返回false
+	bool Acquire()
+	{
+		if(GetAllowed() <= 0)
+		{
+			return false;
+		}
+		MutexLock l(&mu_);
+		intptr_t x=GetAllowed();
+		if(x<=0)
+			return false;
+		else
+		{
+			SetAllowed(x-1);
+			return true;
+		}
+	}
+	
+	// 释放一个通过Acquire()获得的资源
+	void Release()
+	{
+		MutexLock l(mu_);
+		SetAllowed(GetAllowed() +1);
+	}
+	
+private:
+	port::Mutex mu_;
+	port::AtomicPointer allowed_;
+
+	intptr_t GetAllowed() const
+	{
+		return reinterpret_cast<intptr_t>(allowed_.Acquire_Load());
+	}
+	
+	void SetAllowed(intptr_t v)
+	{
+		allowed_.Release_Store(reinterpret_cast<void*>(v));
+	}
+};
 
 static Status PosixError(const std::string& context, int er_number)
 {
@@ -157,6 +203,74 @@ public:
 	}
 };
 
+// 通过 pread() 随机访问
+class PosixRandomAccessFile: public RandomAccessFile 
+{
+private:
+	std::string filename_;
+	bool temporary_fd_;  // true表示fd_是-1，每次read时open
+	int fd_;
+	Limiter* limiter_;
+
+public:
+	PosixRandomAccessFile(const std::string& fname, int fd, Limiter* limiter)
+		:filename_(fname), fd_(fd), limiter_(limiter)
+	{
+		tempory_fd_ = ! limiter->Acquire();
+		if(tempory_fd_)
+		{
+			close(fd_);
+			fd_=-1;
+		}
+	}
+	
+	virtual Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const
+	{
+		int fd=fd_;
+		if(temporary_fd_)
+		{
+			fd=open(filename_.c_str(), O_RDONLY);
+			if(fd<0)
+				return PosixError(filename_, errno);
+		}
+		Status s;
+		ssize_t r=pread(fd, scratch, n, static_cast<off_t>(offset));
+		*result = Slice(scratch, (r<0) ? 0 : r);
+		if(r<0)
+			s=PosixError(filename_, errno);
+		if(temporary_fd_)
+			close(fd);
+		return s;
+	}
+};
+
+// 通过 mmap() 随机访问
+class PosixMmapReadableFile : public RandomAccessFile
+{
+private:
+	std::string filename_;
+	void* mmapped_region_;
+	size_t length_;
+	Limiter* limiter_;
+  
+public:
+	PosixMmapReadableFile(const std::string& fname, void * base, size_t length, Limiter* limiter)
+		: filename_(fname), mmaped_region_(base), length_(length), limiter_(limiter)
+	{}
+	
+	virtual Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const
+	{
+		Status s;
+		if(offset + n > length_)
+		{
+			*result=Slice();
+			s=PosixError(filename_, EINVAL);
+		}
+		else
+			*result=Slice(reinterpret_cast<char*>(mmaped_region_) + offset, n);
+		return s;
+	}
+};
 
 class PosixLockTable{
 private:
@@ -202,17 +316,59 @@ public:
 		return s;
 	}
 	
-	  virtual Status NewSequentialFile(const std::string& fname,
-                                   SequentialFile** result) {
+	virtual Status NewSequentialFile(const std::string& fname,
+							   SequentialFile** result) {
 		int fd = open(fname.c_str(), O_RDONLY);
 		if (fd < 0) {
-		  *result = NULL;
-		  return PosixError(fname, errno);
+			*result = NULL;
+			return PosixError(fname, errno);
 		} else {
-		  *result = new PosixSequentialFile(fname, fd);
-		  return Status::OK();
+			*result = new PosixSequentialFile(fname, fd);
+			return Status::OK();
 		}
-	  }
+	}
+	
+	virtual Status NewRandomAccessFile(const std::string& fname, RandomAccessFile** result)
+	{
+		*result=NULL;
+		Status s;
+		int fd=open(fname.c_str(), O_RDONLY);
+		if(fd<0)
+			s=PosixError(fname, errno);
+		else if(mmap_limit_.Acquire())
+		{
+			uint64_t size;
+			s=GetFileSize(fname, &size);
+			if(s.ok())
+			{
+				void* base=mmap(NULL, size, PORT_READ, MAP_SHARED, fd, 0); // 把文件fd映射到进程base地址处
+				if(base != MAP_FAILED)
+					*result=new PosixMmapReadableFile(fname, base, size, &mmap_limit_);
+				else
+					s=PosixError(fname, errno);
+			}
+			close(fd);
+			if(!s.ok())
+				mmap_limit_.Release();
+		}
+		else
+			*result=new PosixRandomAccessFile(fname, fd, &fd_limit_);
+		return s;
+	}
+	
+	virtual Status GetFileSize(const std::string& fname, uint64_t* size)
+	{
+		Status s;
+		struct stat sbuf;
+		if(stat(fname.c_str(), &sbuf) != 0)
+		{
+			*size=0;
+			s=PosixError(fname, errno);
+		}
+		else
+			*size=sbuf.st_size;
+		return s;
+	}
 	
 	virtual Status DeleteFile(const std::string& fname)
 	{
@@ -324,6 +480,7 @@ private:
 	BGQueue queue_;
 	
 	PosixLockTable locks_;
+	Limiter mmap_limit_;
 };
 
 
@@ -346,6 +503,8 @@ void PosixEnv::Schedule(void (*function)(void*), void* arg)
 
 	PthreadCall("unlock", pthread_mutex_unlock(&mu_));
 }
+
+
 
 namespace {
 struct StartThreadState {

@@ -1,4 +1,5 @@
 
+#include "util/hash.h" // Hash()函数
 
 namespace leveldb
 {
@@ -21,7 +22,7 @@ namespace leveldb
 struct LRUHandle{
 	void* value;
 	void (*deleter)(const Slice&, void *value);
-	LRUHandle* next_hash;
+	LRUHandle* next_hash; //
 	LRUHandle* next;
 	LRUHandle* prev;
 	size_t key_length;
@@ -99,6 +100,10 @@ public:
 		return shard_[Shard(hash)].Lookup(key, hash);
 	}
 	
+	virtual uint64_t NewId() {
+		MutexLock l(&id_mutex_);
+		return ++(last_id_);
+	}
 };
 
 
