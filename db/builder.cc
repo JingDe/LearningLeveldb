@@ -6,7 +6,7 @@ Status BuildTable(const std::string& dbname,
                          Env* env,
                          const Options& options,
                          TableCache* table_cache,
-                         Iterator* iter,
+                         Iterator* iter, // memtable的迭代器
                          FileMetaData* meta){
 	Status s;
 	meta->file_size=0;
@@ -46,9 +46,19 @@ Status BuildTable(const std::string& dbname,
 		
 		if(s.ok())
 		{
+			// 验证文件可用
 			Iterator* it=table_cache->NewIterator(ReadOptions(), meta->number, meta->file_size);
 			s=it->status();
 			delete it;
 		}
 	}
+	
+	if(!iter->status().ok())
+		s=iter->status();
+	
+	if(s.ok()  &&  meta->file_size>0)
+	{}
+	else
+		env->DeleteFile(fname);
+	return s;
 }

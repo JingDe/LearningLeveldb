@@ -15,7 +15,7 @@ Status BlockHandle::DecodeFrom(Slice* input)
 		return Status::Corruption("bad block handle");
 }
 
-
+// 读取文件file的handle位置的块的数据到result中
 Status ReadBlock(RandomAccessFile* file, const ReadOptions& options, 
 				const BlockHandle& handle, BlockContents* result)
 {

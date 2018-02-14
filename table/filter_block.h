@@ -15,3 +15,15 @@ class FilterBlockBuilder{
 	std::vector<Slice> tmp_keys_;   // policy_->CreateFilter() argument
 	std::vector<uint32_t> filter_offsets_; // 每一个filter数据在results_中的开始位置
 };
+
+class FilterBlockReader{
+	
+	// 要求contents和policy必须在*this存在时存在
+	FilterBlockReader(const FilterPolicy* policy, const Slice& contents);
+	
+	const FilterPolicy* policy_;
+	const char* data_;    // 指向filter数据
+	const char* offset_;  // 指向offset数组
+	size_t num_;          // offset数组的entry数
+	size_t base_lg_; 	  // 编码参数
+};

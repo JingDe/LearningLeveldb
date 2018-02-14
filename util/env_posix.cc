@@ -224,6 +224,15 @@ public:
 		}
 	}
 	
+	virtual ~PosixRandomAccessFile()
+	{
+		if(!temporary_fd_)
+		{
+			close(fd_);
+			limiter_->Release();
+		}
+	}
+	
 	virtual Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const
 	{
 		int fd=fd_;
@@ -257,6 +266,12 @@ public:
 	PosixMmapReadableFile(const std::string& fname, void * base, size_t length, Limiter* limiter)
 		: filename_(fname), mmaped_region_(base), length_(length), limiter_(limiter)
 	{}
+	
+	virtual ~PosixMmapReadableFile()
+	{
+		munmap(mmapped_region_, length_);
+		limiter_->Release();
+	}
 	
 	virtual Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const
 	{

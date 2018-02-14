@@ -22,6 +22,12 @@ Block::Block(const BlockContents& contents)
 	}
 }
 
+Block::~Block()
+{
+	if(owned_)
+		delete []data_;
+}
+
 // 解码下一个块entry，开始于p，存储共享key的字节数、不共享的字节数、value的长度
 // limit之后不解引用
 static inline const char* DecodeEntry(const char* p, const char* limit, 
@@ -38,9 +44,9 @@ static inline const char* DecodeEntry(const char* p, const char* limit,
 	}
 	else
 	{
-		if((p=GetVarint32Ptr(p, limit, shared))==NULL)  return NULL;
-		if ((p = GetVarint32Ptr(p, limit, non_shared)) == NULL) return NULL;
-		if ((p = GetVarint32Ptr(p, limit, value_length)) == NULL) return NULL;
+		if((p=GetVarint32Ptr(p, limit, shared))==NULL)  return NULL; // 编码为1~4个字节
+		if ((p = GetVarint32Ptr(p, limit, non_shared)) == NULL) return NULL; // 编码为1~4个字节
+		if ((p = GetVarint32Ptr(p, limit, value_length)) == NULL) return NULL; // 编码为1~4个字节
 	}
 	
 	if(static_cast<uint32_t>(limit-p) < (*non_shared + *value_length))
@@ -99,9 +105,10 @@ public:
 		return DecodeFixed32(data_ + restarts_ + index*sizeof(uint32_t));
 	}
 	
+	// seek到大于等于target的entry
 	virtual void Seek(const Slice& target)
-	{
-		// 在restart数组中二分查找，查找最后一个有key小于target的重启点
+	{	
+		// 在restart数组中二分查找，查找最后一个有key小于target的重启点	
 		uint32_t left=0;
 		uint32_t right=num_restarts_ -1;
 		while(left < right)
@@ -128,7 +135,8 @@ public:
 		{
 			if(!ParseNextKey())
 				return;
-			
+			if(Compare(key_, target) >= 0)
+				return ;
 		}
 	}
 	
@@ -156,7 +164,20 @@ private:
 		
 		uint32_t shared, non_shared, value_length;
 		p=DecodeEntry(p, limit, &shared, &non_shared, &value_length);
-		
+		if(p==NULL  || key_.size() < shared) // key_是重启点的key_
+		{
+			CorruptionError();
+			return false;
+		}
+		else
+		{
+			key_.resize(shared);
+			key_.append(p, non_shared);
+			value_=Slice(p+non_shared, value_length);
+			while(restart_index_ + 1 < num_restarts  &&  GetRestartPoint(restart_index_ +1) < current_)
+				++ restart_index_;
+			return true;
+		}
 	}
 };
 

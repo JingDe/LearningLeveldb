@@ -6,7 +6,7 @@ class Block{
 	
 	Iterator* NewIterator(const Comparator* comparator);
 	
-	const char* data_;
+	const char* data_; // block的数据
     size_t size_; // block的大小（不包括CompressionType或crc)
 	uint32_t restart_offset_; // restart数组在data_中的偏移位置
 	bool owned_; // Block是否拥有data_

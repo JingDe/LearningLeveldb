@@ -46,3 +46,22 @@ void FilterBlockBuilder::GenerateFilter()
 	keys_.clear(); // 清除当前所有key
 	start_.clear();
 }
+
+FilterBlockReader::FilterBlockReader(const FilterPolicy* policy, const Slice& contents)
+	: policy_(policy),
+	data_(NULL),
+	offset_(NULL),
+	num_(0),
+	base_lg_(0)
+{
+	size_t n=contents.size();
+	if(n<5) // 1个字节是base_lg_，4个字节是offset数组
+		return;
+	base_lg_ = contents[n-1];
+	uint32_t last_word=DecodeFixed32(contents.data()+n-5);
+	if(last_word > n-5)
+		return;
+	data_ = contents.data();
+	offset_= data_ +last_word;
+	num_ = (n-5-last_word) / 4;
+}
