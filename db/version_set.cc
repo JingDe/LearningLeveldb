@@ -530,3 +530,5 @@ void VersionSet::Finalize(Version* v) // 计算下一次compaction的层
 	v->compaction_level_=best_level;
 	v->compaction_score_=best_score;
 }
+
+Status VersionSet::LogAndApply(VersionEdit* edit, 

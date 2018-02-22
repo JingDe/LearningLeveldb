@@ -42,6 +42,8 @@ class VersionSet{
 public:
 	VersionSet(const std::string& dbname, const Options* options, TableCache* table_cache, const InternalKeyComparator*);
 	
+	Status LogAndApply(VersionEdit* edit, port::Mutex* mu) EXCLUSIVE_LOCKS_REQUIRED(mu);
+	  
 	Status Recover(bool *save_manifest); // 从文件中恢复最近保存的 descriptor
 	
 	uint64_t NewFileNumber() { return next_file_number_++; }

@@ -89,6 +89,10 @@ private:
 	void operator=(const WritableFile&);
 };
 
+class Logger{
+	virtual void Logv(const char* format, va_list ap) = 0;
+};
+
 	
 class FileLock{
 public:
@@ -98,6 +102,7 @@ private:
 	FileLock(const FileLock&);
 	void operator=(const FileLock&);
 };
+
 
 }
 #endif
