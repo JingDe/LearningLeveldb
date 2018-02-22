@@ -47,6 +47,28 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr)
 	
 	bool save_manifest=false;
 	Status s=impl->Recover(&edit, &save_manifest);
+	if(s.ok()  &&  impl->mem_==NULL)
+	{
+		uint64_t new_log_number=impl->versions_->NewFileNumber();
+		WritableFile* lfile; // 新log文件
+		s=options.env->NewWritableFile(LogFileName(dbname, new_log_number), &lfile);
+		if(s.ok())
+		{
+			edit.SetLogNumber(new_log_number);
+			impl->logfile_ =lfile;
+			impl->logfile_number_ =new_log_number;
+			impl->log_ =new log::Writer(lfile);
+			impl->mem_ =new MemTable(impl->internal_comparator_);
+			impl->mem_->Ref();
+		}
+	}
+	if(s.ok()  &&  save_manifest)
+	{
+		edit.SetPrevLogNumber(0);
+		edit.SetLogNumber(impl->logfile_number_);
+		s=impl->versions_->LogAndApply(&edit, &impl->mutex_);
+	}
+	
 }
 
 
@@ -163,11 +185,15 @@ Status DBImpl::Recover(VersionEdit* edit, bool *save_manifest)
 		s=RecoverLogFile(logs[i], (i==logs.size()-1), save_manifest, edit, &max_sequence);
 		if(!s.ok())
 			return s;
+		
 		// 先前的数据库化身可能在分配log序号后没有写MANIFEST记录，在VersionSet中手动更新文件序号分配计数
-		//versions_->MarkFileNumberUsed(logs[i]);
+		versions_->MarkFileNumberUsed(logs[i]);
 	}
 	
+	if(versions_->LastSequence() < max_sequence)
+		versions_->SetLastSequence(max_sequence);
 	
+	return Status::OK();
 }
 
 Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log, bool* save_manifest, 
@@ -188,7 +214,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log, bool* save_man
 	mutex_.AssertHeld();
 	
 	std::string fname=LogFileName(dbname_, log_number); // .log文件
-	SequencitalFile* file;
+	SequentialFile* file;
 	Status status=env_->NewSequentialFile(fname, &file);
 	if(!status.ok())
 	{
@@ -239,8 +265,48 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log, bool* save_man
 			compactions++;
 			*save_manifest=true;
 			status=WriteLevel0Table(mem, edit, NULL);
-			
+			mem->Unref();
+			mem=NULL;
+			if(!stats.ok())
+				break;
 		}
+	}
+	
+	delete file;
+	
+	// 检查是否可以重用最后的log文件
+	if(status.ok()  &&  options_.reuse_logs  &&  last_log  &&  compactions==0)
+	{
+		assert(logfile_ == NULL);
+		assert(log_ == NULL);
+		assert(mem_ == NULL);
+		uint64_t lfile_size;
+		if(env_->GetFileSize(fname, &lfile_size).ok()  &&  env_->NewAppendableFile(fname, &logfile_).ok())
+		{
+			Log(options_.info_log, "Reusing old log %s \n", fname.c_str());
+			log_ =new log::Writer(logfile_, lfile_size);
+			logfile_number_=log_number;
+			if(mem !=NULL)
+			{
+				mem_=mem;
+				mem=NULL;
+			}
+			else
+			{
+				mem_=new MemTable(internal_comparator_);
+				mem_->Ref();
+			}
+		}
+	}
+	
+	if(mem !=NULL)
+	{
+		if(status.ok())
+		{
+			*save_manifest=true;
+			status=WriteLevel0Table(mem, edit, NULL);
+		}
+		mem->Unref();
 	}
 }
 
@@ -270,11 +336,31 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base)
 	Status s;
 	{
 		mutex_.Unlock();
-		s=BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
+		s=BuildTable(dbname_, env_, options_, table_cache_, iter, &meta); // 从mem/iter中创建ldb文件,返回meta
 		mutex_.Lock();
 	}
 	
-
+	Log(options_.info_log, "Level-0 table #%llu: %lld bytes %s",
+			(unsigned long long) meta.number, (unsigned long long) meta.file_size,
+			s.ToString().c_str());
+	delete iter;
+	pending_outputs_.erase(meta.number);
+	
+	int level=0;
+	if(s.ok()  &&  meta.file_size >0)
+	{
+		const Slice min_user_key = meta.smallest.user_key();
+		const Slice max_user_key = meta.largest.user_key();
+		if(base != NULL)
+			level=base->PickLevelForMemTableOutput(min_user_key, max_user_key);
+		edit->AddFile(level, meta.number, meta.file_size, meta.smallest, meta.largest);
+	}
+	
+	CompactionStats stats;
+	stats.micros = env_->NowMicros() - start_micros;
+	stats.bytes_written=meta.file_size;
+	stats_[level].Add(stats);
+	return s;
 }
 
 }

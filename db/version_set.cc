@@ -1,4 +1,12 @@
 
+static int TargetFileSize(const Options* options) {
+	return options->max_file_size;
+}
+
+static int64_t MaxGrandParentOverlapBytes(const Options* options) {
+	return 10 * TargetFileSize(options);
+}
+
 static double MaxBytesForLevel(const Options* options, int level)
 {
 	double result= 10. * 1048576.0;
@@ -10,6 +18,19 @@ static double MaxBytesForLevel(const Options* options, int level)
 	return result;
 }
 
+int FindFile(const InternalKeyComparator& icmp, const std::vector<FileMetaData*>& files, const Slice& key)
+{
+	uint32_t left=0;
+	uint32_t right=files.size();
+	while(left < right)
+	{
+		uint32_t mid=(left + right) /2;
+		const FileMetaData* f=files[mid];
+		if(icmp.InternalKeyComparator::Compare(f->largest.Encode(), key) <0)
+			left=mid+1;
+	}
+}
+
 void Version::Unref()
 {
 	assert(this != &vset_->dummy_versions_);
@@ -17,6 +38,75 @@ void Version::Unref()
 	--refs_;
 	if(refs_ == 0)
 		delete this;
+}
+
+void Version::OverlapInLevel(int level, const Slice* smallest_user_key, const Slice* largest_user_key)
+{
+	return SomeFileOverlapsRange(vset_->icmp_, (level>0), file_[level], smallest_user_key, largest_user_key);
+}
+
+// 在某一层的files中查找是否有重叠的key，对files重叠的0层遍历，files不重叠的其他层二分查找
+bool SomeFileOverlapsRange(const InternalKeyComparator& icmp,
+    bool disjoint_sorted_files,
+    const std::vector<FileMetaData*>& files,
+    const Slice* smallest_user_key,
+    const Slice* largest_user_key) 
+{
+	const Comparator* ucmp=icmp.user_comparator();
+	if(!disjoint_sorted_files) // level==0, files重叠
+	{
+		for(size_t i=0; i<files.size(); i++)
+		{
+			const FileMetaData* f=files[i];
+			if(AfterFile(ucmp, smallest_user_key, f)  ||  BeforeFile(ucmp, largest_user_key, f))
+			{
+				//不重叠
+			}
+			else
+				return true;
+		}
+		return false;
+	}
+	
+	uint32_t index=0;
+	if(smallest_user_key != NULL)
+	{
+		InternalKey small(*smallest_user_key, kMaxSequenceNumber, kValueTypeForSeek);
+		index =FindFile(icmp, files, small.Encode());
+	}
+	
+	if(index >= files.size())
+		return false;
+	
+	return !BeforeFile(ucmp, largest_user_key, files[index]);
+}
+
+// 返回应该在其中放置一个新的memtable compaction结果的层，
+// 这个结果覆盖了[smallest_user_key,largest_user_key]
+int Version::PickLevelForMemTableOutput(const Slice& smallest_user_key, const Slice& largest_user_key)
+{
+	int level=0;
+	if(!OverlapInLevel(0, &smallest_user_key, &largest_user_key))
+	{
+		// 如果下一层没有重叠，并且下下一层重叠的字节有限，push到下一层
+		InternalKey start(smallest_user_key, kMaxSequenceNumber, kValueTypeForSeek);
+		InternalKey limit(largest_user_key, 0, static_cast<ValueType>(0));
+		std::vector<FileMetaData*> overlaps;
+		while(level < config::kMaxMemCompactLevel)
+		{
+			if(OverlapInLevel(level +1, &smallest_user_key, &largest_user_key))
+				break;
+			if(level+2 < config::kNumLevels) // 检查文件不与太多的祖父字节重叠
+			{
+				GetOverlappingInputs(level+2, &start, &limit, &overlaps);
+				const int64_t sum=TotalFileSize(overlaps);
+				if(sum > MaxGrandParentOverlapBytes(vset_->options_))
+					break;
+			}
+			level++;
+		}
+	}
+	return level;
 }
 
 
@@ -52,6 +142,53 @@ void VersionSet::AppendVersion(Version* v)
 	v->next_=dummy_versions_;
 	v->perv_->next_ =v;
 	v->next_->prev_ =v;
+}
+
+// 在inputs中存储level层所有与[begin, end]重叠的文件
+void Version::GetOverlappingInputs(int level, const InternalKey* begin, const InternalKey* end, 
+		std::vector<FileMetaData*>* inputs)
+{
+	assert(level >=0);
+	assert(level < config::kNumLevels);
+	inputs->clear();
+	Slice user_begin, user_end;
+	if(begin != NULL)
+		user_begin = begin->user_key();
+	if(end != NULL)
+		user_end = end->user_key();
+	
+	const Comparator* user_cmp=vset_->icmp_.user_comparator();
+	for(size_t i=0; i<files_[level].size(); )
+	{
+		FileMetaData* f=files_[level][i++];
+		const Slice file_start=f->smallest.user_key();
+		const Slice file_limit=f->largest.user_key();
+		if(begin !=NULL  &&  user_cmp->Compare(file_limit, user_begin)<0)
+		{}
+		else if(end!=NULL  &&  user_cmp->Compare(file_start, user_end) > 0)
+		{}
+		else
+		{
+			inputs->push_back(f);
+			if(level ==0)
+			{
+				// level 0层的文件可能相互重叠，检查加入的文件是否拓展了范围
+				// 是，则重新检查level 0所有文件
+				if(begin !=NULL  &&  user_cmp->Compare(file_start, user_begin) <0)
+				{
+					user_begin=file_start;
+					inputs->clear();
+					i=0;
+				}
+				else if(end != NULL  &&  user_cmp->Compare(file_limit, user_end) >0)
+				{
+					user_end=file_limit;
+					inputs->clear();
+					i=0;
+				}
+			}
+		}
+	}
 }
 
 class VersionSet::Builder{

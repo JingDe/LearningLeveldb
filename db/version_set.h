@@ -2,6 +2,18 @@
 class Version {
 
 	void Unref();
+	
+	// 如果在level层的某些文件与[*smallest_user_key,*largest_user_key]部分重叠返回true
+	// smallest_user_key==NULL表示小于DB中所有key的key
+	bool OverlapInLevel(int level,
+                      const Slice* smallest_user_key,
+                      const Slice* largest_user_key);
+					  
+	// 返回应该在其中放置一个新的memtable compaction结果的层，
+	// 这个结果覆盖了[smallest_user_key,largest_user_key]
+	int PickLevelForMemTableOutput(const Slice& smallest_user_key,
+                                 const Slice& largest_user_key);
+	
 
 	VersionSet* vset_;
 	Version* next_;

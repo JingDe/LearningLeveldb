@@ -175,9 +175,15 @@ Iterator* Table::BlockReader(void *arg, const ReadOptions& options, const Slice&
 Iterator* Table::NewIterator(const ReadOptions& options) const
 {
 	return NewTwoLevelIterator(
-		rep_->index_block->NewIterator(rep_->options.comparator),
-		&Table::BlockReader, // 
+		rep_->index_block->NewIterator(rep_->options.comparator), // 索引块的迭代器
+		&Table::BlockReader, // 获得数据block的迭代器的函数
 		const_cast<Table*>(this),
 		options
 	);
+}
+
+static void DeleteCachedBlock(const Slice& key, void* value)
+{
+	Block* block=reinterpret_cast<Block*>(value);
+	delete block;
 }

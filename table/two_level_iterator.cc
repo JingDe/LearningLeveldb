@@ -14,7 +14,7 @@ class TwoLevelIterator : public Iterator{
 	IteratorWrapper index_iter_;
 	IteratorWrapper data_iter_; // 可以NULL
 	std::string data_block_handle_; 
-		// 如果data_iter_非空，data_block_handle_保存传递给block_function_创建data_iter的index_value
+		// 如果 data_iter_ 非空, data_block_handle_ 保存传递给 block_function_ 创建 data_iter_ 的 index_value
 };
 
 TwoLevelIterator::TwoLevelIterator(terator* index_iter,

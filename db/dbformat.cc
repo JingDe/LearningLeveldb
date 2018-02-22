@@ -6,6 +6,12 @@ static uint64_t PackSequenceAndType(uint64_t seq, ValueType t)
 	return (seq<<8)  |  t;
 }
 
+void AppendInternalKey(std::string* result, const ParseInternalKey& key)
+{
+	result->append(key.user_key.data(), key.user_key.size());
+	PutFixed64(result, PackSequenceAndType(key.sequence, key.type));
+}
+
 void InternalKeyComparator::FindShortestSeparator(std::string* start, const Slice& limit) const
 {
 	// 缩短key的用户部分

@@ -22,8 +22,8 @@ namespace leveldb
 struct LRUHandle{
 	void* value;
 	void (*deleter)(const Slice&, void *value);
-	LRUHandle* next_hash; //
-	LRUHandle* next;
+	LRUHandle* next_hash; //链接HandleTable的所有LRUHandle的指针
+	LRUHandle* next; // next和prev链接LRUCache的两条链表的指针
 	LRUHandle* prev;
 	size_t key_length;
 	bool in_cache; // 该entry是否在cache中

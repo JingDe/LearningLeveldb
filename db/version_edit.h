@@ -39,6 +39,19 @@ public:
 		last_sequence_=seq;
 	}
 	
+	void AddFile(int level, uint64_t file,
+               uint64_t file_size,
+               const InternalKey& smallest,
+               const InternalKey& largest) 
+	{
+		FileMetaData f;
+		f.number = file;
+		f.file_size = file_size;
+		f.smallest = smallest;
+		f.largest = largest;
+		new_files_.push_back(std::make_pair(level, f));
+	}
+	
 	void EncodeTo(std::string* dst) const;
 	
 	Status DecodeFrom(const Slice& src);
