@@ -41,7 +41,23 @@ typedef struct leveldb_writablefile_t  leveldb_writablefile_t;
 typedef struct leveldb_writebatch_t    leveldb_writebatch_t;
 typedef struct leveldb_writeoptions_t  leveldb_writeoptions_t;
 
+LEVELDB_EXPORT leveldb_t* leveldb_open(const leveldb_options_t* options,
+                                       const char* name, char** errptr);
 
+LEVELDB_EXPORT void leveldb_close(leveldb_t* db);
+
+LEVELDB_EXPORT void leveldb_release_snapshot(
+    leveldb_t* db, const leveldb_snapshot_t* snapshot);
+	
+LEVELDB_EXPORT char* leveldb_property_value(leveldb_t* db,
+                                            const char* propname);
+											
+enum {
+  leveldb_no_compression = 0,
+  leveldb_snappy_compression = 1
+};
+LEVELDB_EXPORT void leveldb_options_set_compression(leveldb_options_t*, int);
+											
 #ifdef __cplusplus
 }  /* end extern "C" */
 #endif

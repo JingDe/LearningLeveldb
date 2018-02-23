@@ -1,0 +1,3 @@
+
+class SnapshotImpl : public Snapshot {
+};

@@ -36,6 +36,21 @@ static Status DoWriteStringToFile(Env* env, const Slice& data, const std::string
 	return s;
 }
 
+Status ReadFileToString(Env* env, const std::string& fname, std::string* data)
+{
+	data->clear();
+	SequentialFile* file;
+	Status s=env->NewSequentialFile(fname, &file);
+	
+}
+
+Status WriteStringToFile(Env* env, const Slice& data,
+                         const std::string& fname) {
+  return DoWriteStringToFile(env, data, fname, false);
+}
+
+
+
 Status WriteStringToFileSync(Env* env, const Slice& data, const std::string& fname)
 {
 	return DoWriteStringToFile(env, data, fname, true);

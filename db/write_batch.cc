@@ -1,5 +1,18 @@
 
 
+// WriteBatch::rep_ :=
+//    sequence: fixed64
+//    count: fixed32
+//    data: record[count]
+// record :=
+//    kTypeValue varstring varstring         |
+//    kTypeDeletion varstring
+// varstring :=
+//    len: varint32
+//    data: uint8[len]
+
+
+
 // writebatch头有8字节sequence号+4字节count
 static const size_t kHeader = 12;
 

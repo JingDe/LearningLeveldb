@@ -217,7 +217,8 @@ class VersionSet::Builder{
 public:
 	Builder(VersionSet* vset, Version* base)
 		:vset_(vset),
-		base_(base){
+		base_(base)
+	{
 		base_->Ref(); // 增加引用计数，不会释放
 		BySmallestKey cmp;
 		cmp.internal_comparator= &vset_->icmp_;
@@ -531,4 +532,73 @@ void VersionSet::Finalize(Version* v) // 计算下一次compaction的层
 	v->compaction_score_=best_score;
 }
 
-Status VersionSet::LogAndApply(VersionEdit* edit, 
+Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu)
+{
+	if(edit->has_log_number_)
+	{
+		assert(edit->log_number_ >= log_number_);
+		assert(edit->log_number_ < next_file_number_);
+	}
+	else
+		edit->SetLogNumber(log_number_);
+	
+	if(!edit->has_prev_log_number_)
+		edit->SetPrevLogNumber(prev_log_number_);
+	
+	edit->SetNextFile(next_file_number_);
+	edit->SetLastSequence(last_sequence_);
+	
+	Version* v=new Version(this);
+	{
+		Builder builder(this, current_);
+		builder.Apply(edit);
+		builder.SaveTo(v);
+	}
+	Finalize(v);
+	
+	// 必要时初始化新的descriptor log文件，通过创建一个包含当前版本的snapshot的临时文件
+	std::string new_manifest_file;
+	Status s;
+	if(descriptor_log_ == NULL)
+	{
+		assert(descriptor_file_ ==NULL);
+		new_manifest_file = DescriptorFileName(dbname_, manifest_file_number_);
+		edit->SetNextFile(next_file_number_);
+		s=env_->NewWritableFile(new_manifest_file, &descriptor_file_);
+		if(s.ok())
+		{
+			descriptor_log_=new log::Writer(descriptor_file_);
+			s=WriteSnapshot(descriptor_log_);
+		}
+	}
+	
+	// 在高代价的MANIFEST log的写过程中解锁
+	{
+		mu->Unlock();
+		
+		if(s.ok())
+		{
+			std::string record;
+			edit->EncodeTo*&record);
+			s=descriptor_log_->AddRecord(record);
+			
+		}
+	}
+}
+
+Status VersionSet::WriteSnapshot(log::Writer* log)
+{
+	// 保存metadata
+	VersionEdit edit;
+	edit.SetComparatorName(icmp_.user_comparator()->Name());
+	
+	// 保存compaction指针
+	for(int level=0; level<config::kNumLevels; level++)
+	{
+		if(!compact_pointers_[level].empty())
+		{
+			
+		}
+	}
+}
+

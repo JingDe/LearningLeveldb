@@ -63,7 +63,7 @@ private:
 	uint64_t prev_log_number_;  // 0 or backing store for memtable being compacted
 	
 	WritableFile* descriptor_file_; // MANIFEST文件
-	log::Writer* descriptor_log_;
+	log::Writer* descriptor_log_; // 写 descriptor_file_
 	Version dummy_versions_; // version链表头
 	Version* current_; // dummy_versions_.prev_
 };

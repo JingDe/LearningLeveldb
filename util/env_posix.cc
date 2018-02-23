@@ -4,6 +4,9 @@ namespace leveldb{
 
 namespace{
 
+static int open_read_only_file_limit = -1;
+static int mmap_limit = -1;
+
 class Limiter{
 public:
 	Limiter(intptr_t n)
@@ -593,6 +596,9 @@ Env* Env::Default()
 	return default_env;
 }
 
-
+void EnvPosixTestHelper::SetReadOnlyFDLimit(int limit) {
+	assert(default_env == NULL);
+	open_read_only_file_limit = limit;
+}
 
 }
