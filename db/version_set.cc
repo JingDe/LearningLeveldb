@@ -18,6 +18,17 @@ static double MaxBytesForLevel(const Options* options, int level)
 	return result;
 }
 
+static Iterator* GetFileIterator(void* arg, const ReadOptions& options, const Slice& file_value)
+{
+	TableCache* cache=reinterpret_cast<TableCache*>(arg);
+	if(file_value.size() != 16)
+		return NewErrorIterator();
+	else
+		return cache->NewIterator(options, DecodeFixed64(file_value.data()),
+                              DecodeFixed64(file_value.data() + 8));
+}
+
+
 int FindFile(const InternalKeyComparator& icmp, const std::vector<FileMetaData*>& files, const Slice& key)
 {
 	uint32_t left=0;
@@ -30,6 +41,31 @@ int FindFile(const InternalKeyComparator& icmp, const std::vector<FileMetaData*>
 			left=mid+1;
 	}
 }
+
+// 一个内部迭代器
+// 对给定的version/level对，生成关于level层文件的信息
+// 对给定的entry，key()是出现在文件中的最大key，
+// value()是一个16位值，包含使用EncodeFixed64编码的文件序号和文件大小
+class Version::LevelFileNumIterator: public Iterator{
+	
+	Slice key() const {
+		assert(Valid());
+		return (*flist_)[index_]->largest.Encode();
+	}
+	
+	Slice value() const {
+		assert(Valid());
+		EncodeFixed64(value_buf_, (*flist_)[index_]->number);
+		EncodeFixed64(value_buf_+8, (*flist_)[index_]->file_size);
+		return Slice(value_buf_, sizeof(value_buf_));
+	}
+	
+	const std::vector<FileMetaData*>* const flist_;
+	uint32_t index_;
+	
+	// 
+	mutable char value_buf_[16];
+};
 
 void Version::Unref()
 {
@@ -441,8 +477,10 @@ Status VersionSet::Recover(bool *save_manifest)
 			// 可以使用存在的MANIFEST文件，不需要保存新的
 		}
 		else
-			*save
+			*save_manifest = true;
 	}
+	
+	return s;
 }
 
 // 不能重用MANIFEST的原因有：
@@ -548,9 +586,10 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu)
 	edit->SetNextFile(next_file_number_);
 	edit->SetLastSequence(last_sequence_);
 	
+	// builder模式 构建v,赋给 current_
 	Version* v=new Version(this);
 	{
-		Builder builder(this, current_);
+		Builder builder(this, current_); 
 		builder.Apply(edit);
 		builder.SaveTo(v);
 	}
@@ -568,7 +607,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu)
 		if(s.ok())
 		{
 			descriptor_log_=new log::Writer(descriptor_file_);
-			s=WriteSnapshot(descriptor_log_);
+			s=WriteSnapshot(descriptor_log_); // descriptor_log_即manifest文件 写入当前current_信息
 		}
 	}
 	
@@ -579,11 +618,41 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu)
 		if(s.ok())
 		{
 			std::string record;
-			edit->EncodeTo*&record);
+			edit->EncodeTo(&record);
 			s=descriptor_log_->AddRecord(record);
-			
+			if(s.ok())
+				s=descriptor_file_->Sync();
+			if(!s.ok())
+				Log(options_->info_log, "MANIFEST write: %s\n", s.ToString().c_str());
+		}
+		
+		// 如果刚刚创建了一个新的descriptor文件，通过写一个新CURRENT文件安装它
+		if(s.ok()  &&  !new_manifest_file.empty())
+			s=SetCurrentFile(env_, dbname_, manifest_file_number_);
+		
+		mu->Lock();
+	}
+	
+	if(s.ok())
+	{
+		AppendVersion(v);
+		log_number_ =edit->log_number_;
+		prev_log_number_ =edit->prev_log_number_;
+	}
+	else
+	{
+		delete v;
+		if(!new_manifest_file.empty())
+		{
+			delete descriptor_log_;
+			delete descriptor_file_;
+			descriptor_log_ =NULL;
+			descriptor_file_ =NULL;
+			env_->DeleteFile(new_manifest_file);
 		}
 	}
+	
+	return s;
 }
 
 Status VersionSet::WriteSnapshot(log::Writer* log)
@@ -595,10 +664,248 @@ Status VersionSet::WriteSnapshot(log::Writer* log)
 	// 保存compaction指针
 	for(int level=0; level<config::kNumLevels; level++)
 	{
-		if(!compact_pointers_[level].empty())
+		if(!compact_pointer_[level].empty())
 		{
-			
+			InternalKey key;
+			key.DecodeFrom(compact_pointer_[level]);
+			edit.SetCompactPointer(level, key);
 		}
 	}
+	
+	for(int level=0; level < config::kNumLevels; level++)
+	{
+		const std::vector<FileMetaData*>& files=current_->files_[level];
+		for(size_t i=0; i<files.size(); i++)
+		{
+			const FileMetaData* f=files[i];
+			edit.AddFile(level, f->number, f->file_size, f->smallest, f->largest);
+		}
+	}
+	
+	std::string record;
+	edit.EncodeTo(&record);
+	return log->AddRecord(record);
 }
+
+Compaction* VersionSet::CompactRange(int level, const InternalKey* begin, const InternalKey* end)
+{
+	std::vector<FileMetaData*> inputs;
+	current_->GetOverlappingInputs(level, begin, end, &inputs);
+	if(inputs.empty())
+		return NULL;
+	
+	// 避免range太大时一次compact太多
+	// 不包含0层：因为0层会overlap，必须两个文件overlap必须删除一个文件保留一个文件
+	if(level >0)
+	{
+		const uint64_t limit=MaxFileSizeForLevel(options_, level);
+		uint64_t total=0;
+		for(size_t i=0; i<inputs.size(); i++)
+		{
+			 uint64_t s=inputs[i]->file_size;
+			 total += s;
+			 if(total >= limit)
+			 {
+				 inputs.resize(i+1);
+				 break;
+			 }
+		}
+	}
+	
+	Compaction* c=new Compaction(options_, level);
+	c->input_version_ =current_;
+	c->input_version_->Ref();
+	c->inputs_[0] = inputs;
+	SetupOtherInputs(c);
+	return c;
+}
+
+void VersionSet::SetupOtherInputs(Compaction* c)
+{
+	const int level = c->level();
+	InternalKey smallest, largest;
+	GetRange(c->inputs_[0], &smallest, &largest);
+	
+	current_->GetOverlappingInputs(level+1, &smallest, &largest, &c->inputs_[1]); // 获得下一层overlap的文件
+	
+	InternalKey all_start, all_limit;
+	GetRange2(c->inputs_[0], c->inputs_[1], &all_start, &all_limit); 
+		// 获得覆盖c->inputs_[0]和c->inputs_[1]的最小范围
+	
+	// 检查是否可以增加level层的inputs的数量，而不改变挑选的level+1层的文件数量
+	if(!c->inputs_[1].empty())
+	{
+		std::vector<FileMetaData*> expanded0;
+		current_->GetOverlappingInputs(level, &all_start, &all_limit, &expanded0); // expanded0是level层覆盖all_start, all_limit的文件
+		const int64_t inputs0_size =TotalFileSize(c->inputs_[0]);
+		const int64_t inputs1_size =TotalFileSize(c->inputs_[1]);
+		const int64_t expanded0_size =TotalFileSize(expanded0);
+		if(expanded0.size() > c->inputs_[0].size()  &&  inputs1_size + expanded0_size < ExpandedCompactionByteSizeLimit(options_))
+		{
+			InternalKey new_start, new_limit;
+			GetRange(expanded0, &new_start, &new_limit);
+			std::vector<FileMetaData*> expanded1;
+			current_->GetOverlappingInputs(level+1, &new_start, &new_limit, &expanded1); // expanded1是level+1层覆盖expanded0文件
+			if(expanded1.size() == c->inputs_[1].size())
+			{
+				Log(options_->info_log,
+					"Expanding@%d %d+%d (%ld+%ld bytes) to %d+%d (%ld+%ld bytes)\n",
+					level,
+					int(c->inputs_[0].size()),
+					int(c->inputs_[1].size()),
+					long(inputs0_size), long(inputs1_size),
+					int(expanded0.size()),
+					int(expanded1.size()),
+					long(expanded0_size), long(inputs1_size));
+				smallest =new_start;
+				largest=new_limit;
+				c->inputs_[0]=expanded0;
+				c->inputs_[1]=expanded1;
+				GetRange2(c->inputs_[0], c->inputs_[1], &all_start, &all_limit);
+			}
+		}
+	}
+	
+	// 计算grandparent的与此次compaction重叠的文件集合
+	if(level +2 < config::kNumLevels)
+		current_->GetOverlappingInputs(level+2, &all_start, &all_limit, &c->grandparents_);
+	
+	// 更新对level层进行下一次compaction的位置
+	compact_pointer_[level]=largest.Encode().ToString();
+	c->edit_.SetCompactPointer(level, largest);
+}
+
+// 为新compaction选择层和inputs
+// 如果没有compaction返回NULL
+// 否则返回一个指针，指向一个堆上分配的描述compaction对象，调用者delete
+Compaction* VersionSet::PickCompaction()
+{
+	Compaction* c;
+	int level;
+	
+	// 倾向于一层数据过多时compaction，而不是seek次数多而compaction
+	const bool size_compaction =(current_->compaction_score_ >=1);
+	const bool seek_compaction =(current_->file_to_compact_ !=NULL);
+	if(size_compaction)
+	{
+		level =current_->compaction_level_;
+		assert(level >=0);
+		assert(level+1 < config::kNumLevels);
+		c=new Compaction(options_, level);
+		
+		for(size_t i=0; i<current_->files_[level].size(); i++)
+		{
+			FileMetaData* f=current_->files_[level][i];
+			if(compact_pointer_[level].empty()  ||  icmp_.Compare(f->largest.Encode(), compact_pointer_[level]) >0)
+			{
+				c->inputs_[0].push_back(f);
+				break;
+			}
+		}
+		if(c->inputs_[0].empty())
+			c->inputs_[0].push_back(current_->files[level][0]);
+	}
+	else if(seek_compaction)
+	{
+		level=current_->file_to_compact_level_;
+		c =new Compaction(options_, level);
+		c->inputs_[0].push_back(current_->file_to_compact_);
+	}
+	else
+		return NULL;
+	
+	c->input_version_ =current_;
+	c->input_version_->Ref();
+	
+	if(level ==0)
+	{
+		InternalKey smallest, largest;
+		GetRange(c->inputs{[0], &smallest, &largest);
+		current_->GetOverlappingInputs(0, &smallest, &largest, &c->inputs_[0]);
+		assert(!c->inputs_[0].empty());
+	}
+	
+	SetupOtherInputs(c);
+	
+	return c;
+}
+
+Iterator* VersionSet::MakeInputIterator(Compaction* c)
+{
+	ReadOptions options;
+	options.verify_checksums=options_->paranoid_checks;
+	options.fill_cache=false;
+	
+	// 0层文件需要一起merge
+	// 对其他层，每层创建一个concatenating迭代器
+	const int space=(c->level() ==0 ?  c->inputs_[0].size()+1  :  2);
+	Iterator** list=new Iterator*[space];
+	int num=0;
+	for(int which=0; which <2; which++)
+	{
+		if(!c->inputs_[which].empty())
+		{
+			if(c->level() + which ==0)
+			{
+				const std::vector<FileMetaData*>& files=c->inputs_[which];
+				for(size_t i=0; i<files.size(); i++) // 0层的每个文件一个迭代器
+					list[num++]=table_cache_->NewIterator(options, files[i]->number, files[i]->file_size);
+			}
+			else
+			{
+				// 其他层，每层文件创建concatenating迭代器
+				list[num++]=NewTwoLevelIterator(new Version::LevelFileNumIterator(icmp_, &c->inputs_[which]), 
+					&GetFileIterator, table_cache_, options);
+			}
+		}
+	}
+	
+	assert(num <= space);
+	Iterator* result = NewMergingIterator(&icmp_, list, num);
+	delete[] list;
+	return result;
+}
+
+bool Compaction::IsTrivialMove() const
+{
+	const VersionSet* vset=input_version_->vset_;
+	
+	// 如果有大量overlap的grandparent数据，避免移动
+	// 否则，移动将创建一个parent文件，要求一个昂贵的merge
+	return (num_input_files(0) ==1  &&  num_input_files(1)==0  &&  // level+1层，没有与level层overlap
+			TotalFileSize(grandparents_) <= MaxGrandParentOverlapBytes(vset->options_));
+}
+
+bool Compaction::ShouldStopBefore(const Slice& internal_key)
+{
+	const VersionSet* vset=input_version_->vset_;
+	
+	// 扫描查找最早的包含key的grandparent文件
+	const InternalKeyComparator* icmp=&vset->icmp_;
+	while(grandparent_index_ < grandparents_.size()  &&  
+		icmp->Compare(internal_key, grandparents_[grandparent_index_]->largest.Encode()) >0) 
+	{
+		if(seen_key_)
+			overlapped_bytes_ += grandparents_[grandparent_index_]->file_size;
+		grandparent_index_++;
+	}
+	seen_key_=true;
+	
+	if(overlapped_bytes_ >MaxGrandParentOverlapBytes(vset->options_))
+	{
+		// 当前output的overlap太多，开始新的output
+		overlapped_bytes_ =0;
+		return true;
+	}
+	else
+		return false;
+}
+
+void Compaction::ReleaseInputs() {
+	if (input_version_ != NULL) {
+		input_version_->Unref();
+		input_version_ = NULL;
+	}
+}
+
 

@@ -4,6 +4,35 @@ namespace leveldb{
 const int kNumNonTableCacheFiles = 10;
 
 
+struct DBImpl::CompactionState{
+	Compaction* const compaction;
+	
+	// 不需要服务小于 smallest_snapshot 的快照
+	// 所以如果遇到小于等于smallest_snapshot的sequence number S，
+	// 可以丢弃sequence number小于S的所有相同key的entry
+	SequenceNumber smallest_snapshot;
+	
+	// compaction产生的文件
+	struct Output {
+		uint64_t number;
+		uint64_t file_size;
+		InternalKey smallest, largest;
+	};
+	std::vector<Output> outputs;
+	
+	// 正被生成的output的状态
+	WritableFile* outfile;
+	TableBuilder* builder;
+	
+	explicit CompactionState(Compaction* c)
+      : compaction(c),
+        outfile(NULL),
+        builder(NULL),
+        total_bytes(0) {
+    }
+};
+
+
 // 以下 修整用户提供的options 合理
 template<class T, class V>
 static void ClipToRange(T* ptr, V minvalue, V maxvalue)
@@ -68,9 +97,395 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr)
 		edit.SetLogNumber(impl->logfile_number_);
 		s=impl->versions_->LogAndApply(&edit, &impl->mutex_);
 	}
+	if(s.ok())
+	{
+		impl->DeleteObsoleteFiles();
+		impl->MaybeScheduleCompaction();
+	}
+}
+
+void DBImpl::DeleteObsoleteFiles()
+{
+	if(!bg_error_.ok()) // 有后台错误后，不能确定是否一个新的version被提交，所以不能安全地收集垃圾
+		return;
+	
+	// 所有live文件集合
+	std::set<uint64_t> live=pending_outputs_;
+	versions_->AddLiveFiles(&live); // 添加versions_ 的所有文件到live中
+	
+	std::vector<std::string> filenames;
+	env_->GetChildren(dbname_, &filenames);
+	uint64_t number;
+	FileType type;
+	for(size_t i=0; i<filenames.size(); i++)
+	{
+		if(ParseFileName(filenames[i], &number, &type))
+		{
+			bool keep=true;
+			switch(type)
+			{
+				case kLogFile:
+					keep = ((number >= versions_->LogNumber())  ||  (number == versions_->PrevLogNumber()));
+					break;
+				case kDescriptorFile:
+					keep = (number >= versions_->ManifestFileNumber());
+					break;
+				case kTableFile:
+					keep = (live.find(number) != live.end());
+					break;
+				case kTempFile:
+					keep = (live.find(number) != live.end());
+					break;
+				case kCurrentFile:
+				case kDBLockFile;
+				case kInfoLogFile:
+					keep =true;
+					break;
+			}
+			
+			if(!keep)
+			{
+				if(type == kTableFile)
+					table_cache_->Evict(number);
+				Log(options_.info_log, "Delete type=%d #%lld\n", int(type),
+						static_cast<unsigned long long>(number));
+				env_->DeleteFile(dbname_ +"/" + filenames[i]);
+			}
+		}
+	}
+}
+
+void DBImpl::MaybeScheduleCompaction()
+{
+	mutex_.AssertHeld();
+	if(bg_compaction_scheduled_)
+	{}
+	else if(shutting_down_.Acquire_Load())
+	{}
+	else if(!bg_error_.ok())
+	{}
+	else if(imm_ == NULL  &&  manual_compaction_ == NULL  &&  !versions_->NeedsCompaction())
+	{}
+	else
+	{
+		bg_compaction_scheduled_ =true;
+		env_->Schedule(&DBImpl::BGWork, this);
+	}
+}
+
+void DBImpl::BGWork(void *db)
+{
+	reinterpret_cast<DBImpl*>(db)->BackgroundCall();
+}
+
+void DBImpl::BackgroundCall()
+{
+	MutexLock l(&mutex_);
+	assert(bg_compaction_scheduled_);
+	if(shutting_down_.Acquire_Load())
+	{}
+	else if(!bg_error_.ok())
+	{}
+	else
+		BackgroundCompaction();
+	
+	bg_compaction_scheduled_=false;
+	MaybeScheduleCompaction();
+	bg_cv_.SingnalAll();
+}
+
+void DBImpl::BackgroundCompaction()
+{
+	mutex_.AssertHeld();
+	
+	if(imm_ != NULL)
+	{
+		CompactMemTable();
+		return;
+	}
+	
+	Compaction* c;
+	bool is_manual = (manual_compaction_ != NULL);
+	InternalKey manual_end;
+	if(is_manual)
+	{
+		ManualCompaction* m=manual_compaction_;
+		c=versions_->CompactRange(m->level, m->begin, m->end);
+		m->done = (c==NULL);
+		if(c != NULL)
+			manual_end = c->input(0, c->num_input_files(0)-1) ->largest; // 获得最大的InternalKey
+		Log(options_.info_log,
+			"Manual compaction at level-%d from %s .. %s; will stop at %s\n",
+			m->level,
+			(m->begin ? m->begin->DebugString().c_str() : "(begin)"),
+			(m->end ? m->end->DebugString().c_str() : "(end)"),
+			(m->done ? "(end)" : manual_end.DebugString().c_str()));
+	}
+	else
+		c =versions_->PickCompaction();
+	
+	Status status;
+	if(c ==NULL)
+	{}
+	else if(!is_manual  &&  c->IsTrivialMove()) // level+1层，没有与level层overlap
+	{
+		// 将文件移动到下一层
+		assert(c->num_input_files(0) ==1);
+		FileMetaData* f=c->input(0, 0);
+		c->edit()->DeleteFile(c->level(), f->number);
+		c->edit()->AddFile(c->level()+1, f->number, f->file_size, f->smallest, f->largest);
+		status=versions_->LogAndApply(c->edit(), &mutex_);
+		if(!status.ok())
+			RecordBackgroundError(status);
+		VersionSet::LevelSummaryStorage tmp;
+		Log(options_.info_log, "Moved #%lld to level-%d %lld bytes %s: %s\n",
+			static_cast<unsigned long long>(f->number),
+			c->level() + 1,
+			static_cast<unsigned long long>(f->file_size),
+			status.ToString().c_str(),
+			versions_->LevelSummary(&tmp));
+	}
+	else
+	{
+		CompactionState* compact=new CompactionState(c);
+		status =DoCompactionWork(compact);
+		if(!status.ok())
+			RecordBackgroundError(status);
+		CleanupCompaction(compact);
+		c->ReleaseInputs();
+		DeleteObsoleteFiles();
+	}
+	delete c;
+	
 	
 }
 
+Status DBImpl::DoCompactionWork(CompactionState* compact)
+{
+	const uint64_t start_micros =env_->NowMicros();
+	int64_t imm_micros=0;
+	
+	Log(options_.info_log,  "Compacting %d@%d + %d@%d files",
+      compact->compaction->num_input_files(0),
+      compact->compaction->level(),
+      compact->compaction->num_input_files(1),
+      compact->compaction->level() + 1);
+	  
+	assert(versions_->NumLevelFiles(compact->compaction->level()) >0);
+	assert(compact->builder ==NULL);
+	assert(compact->outfile ==NULL);
+	if(snapshots_.empty())
+		compact->smallest_snapshot =versions_->LastSequence();
+	else
+		compact->smallest_snapshot =snapshots_.oldest()->number;
+	
+	mutex_.Unlock();
+	
+	Iterator* input=versions_->MakeInputIterator(compact->compaction); // 获得需要compaction的所有文件的迭代器
+	input->SeekToFirst();
+	Status status;
+	ParsedInternalKey ikey;
+	std::string current_user_key;
+	bool has_current_user_key =false;
+	SequenceNumber last_sequence_for_key =kMaxSequenceNumber;
+	for(; input->Valid()  &&  !shutting_down_.Acquire_Load(); )
+	{
+		if(has_imm_.NoBarrier_Load() !=NULL)
+		{
+			const uint64_t imm_start=env_->NowMicros();
+			mutex_.Lock();
+			if(imm_ !=NULL)
+			{
+				CompactMemTable();
+				bg_cv_.SignalAll();
+			}
+			mutex_.Unlock();
+			imm_micros += (env_->NowMicros() -imm_start);
+		}
+		
+		Slice key=input->key();
+		if(compact->compaction->ShouldStopBefore(key)  &&  compact->builder !=NULL) 
+			// 当前output的overlap太多，开始新的output
+		{
+			status=FinishCompactionOutputFile(compact, input);
+			if(!status.ok())
+				break;
+		}
+		
+		// 处理key/value，添加到state
+		bool drop=false;
+		if(!ParseInternalKey(key, &ikey))
+		{
+			current_user_key.clear();
+			has_current_user_key =false;
+			last_sequence_for_key =kMaxSequenceNumber;
+		}
+		else
+		{
+			if(!has_current_user_key  ||  user_comparator()->Compare(ikey.user_key, Slice(current_user_key)) !=0)
+			{
+				// 当前user key的首次出现
+				current_user_key.assign(ikey.user_key.data(), ikey.user_key.size());
+				has_current_user_key =true;
+				last_sequence_for_key =kMaxSequenceNumber;
+			}
+			
+			if(last_sequence_for_key <= compact->smallest_snapshot)
+				drop=true; // 被一个拥有相同user key的更新的entry隐藏
+			else if(ikey.type == kTypeDeletion  &&  ikey.sequence <= compact->smallest_snapshot  &&
+					compact->compaction->IsBaseLevelForKey(ikey.user_key))
+			{
+				drop =true;
+			}
+			
+			last_sequence_for_key =ikey.sequence;
+		}
+		
+		if(!drop)
+		{
+			// 必要时打开output文件
+			if(compact->builder ==NULL)
+			{
+				status =OpenCompactionOutputFile(compact);
+				if(!status.ok())
+					break;
+			}
+			if(compact->builder->NumEntries() ==0)
+				compact->current_output()->smallest.DecodeFrom(key);
+			compact->current_output()->largest.DecodeFrom(key);
+			compact->builder->Add(key, input->value());
+			
+			
+		}
+		
+		input->Next();
+	}
+	
+	
+}
+
+Status DBImpl::OpenCompactionOutputFile(CompactionState* compact)
+{
+	assert(compact !=NULL);
+	assert(compact->builder ==NULL);
+	uint64_t file_number;
+	{
+		mutex_.Lock();
+		file_number =versions_->NewFileNumber();
+		pending_outputs_.insert(file_number);
+		CompactionState::Output out;
+		
+	}
+}
+
+Status DBImpl::FinishCompactionOutputFile(CompactionState* compact, Iterator* input)
+{
+	assert(compact != NULL);
+	assert(compact->outfile != NULL);
+	assert(compact->builder != NULL);
+	
+	const uint64_t output_number =compact->current_output()->number;
+	assert(output_number !=0);
+	
+	Status s=input->status();
+	const uint64_t current_entries =compact->builder->NumEntries();
+	if(s.ok())
+		s=compact->builder->Finish();
+	else
+		compact->builder->Abandon();
+	
+	const uint64_t current_bytes =compact->builder->FileSize();
+	compact->current_output()->file_size =current_bytes;
+	compact->total_bytes += current_bytes;
+	delete compact->builder;
+	compact->builder =NULL;
+	
+	if(s.ok())
+		s=compact->outfile->Sync();
+	if(s.ok())
+		s=compact->outfile->Close();
+	delete compact->outfile;
+	compact->outfile =NULL;
+	
+	if(s.ok()  &&  current_entries>0)
+	{
+		// 验证表可用
+		Iterator* iter=table_cache_->NewIterator(ReadOptions(), output_number, current_bytes);
+		s=iter->status();
+		delete iter;
+		if(s.ok())
+		{
+			Log(options_.info_log,
+			  "Generated table #%llu@%d: %lld keys, %lld bytes",
+			  (unsigned long long) output_number,
+			  compact->compaction->level(),
+			  (unsigned long long) current_entries,
+			  (unsigned long long) current_bytes);
+		}
+	}
+	return s;
+}
+
+void DBImpl::CleanupCompaction(CompactionState* compact)
+{
+	mutex_.AssertHeld();
+	if(compact->builder !=NULL)
+	{
+		compact->builder->Abandon();
+		delete compact->builder;
+	}
+	else
+		assert(compact->outfile == NULL);
+	
+	delete compact->outfile;
+	for(size_t i=0; i<compact->outputs.size(); i++)
+	{
+		const CompactionState::Output& out=compact->outputs[i];
+		pending_outputs_.erase(out.number);
+	}
+	delete compact;
+}
+
+void DBImpl::CompactMemTable()
+{
+	mutex_.AssertHeld();
+	assert(imm_ != NULL);
+	
+	VersionEdit edit;
+	Version* base=versions_->current();
+	base->Ref();
+	Status s=WriteLevel0Table(imm_, &edit, base); // 写imm_到ldb文件
+	base->Unref();
+	
+	if(s.ok()  &&  shutting_down_.Acquire_Load())
+		s=Status::IOError("Deleting DB during memtable compaction");
+	
+	// 用生成的Table替换immutable memtable
+	if(s.ok())
+	{
+		edit.SetPrevLogNumber(0);
+		edit.SetLogNumber(logfile_number_); // 不需要以前的logs
+		s=versions_->LogAndApply(&edit, &mutex_);
+	}
+	
+	if(s.ok())
+	{
+		imm_->Unref();
+		imm_ =NULL;
+		has_imm_.Release_Store(NULL);
+		DeleteObsoleteFiles();
+	}
+	else
+		RecordBackgroundError(s);
+}
+
+void DBImpl::RecordBackgroundError(const Status& s) {
+	mutex_.AssertHeld();
+	if (bg_error_.ok()) {
+		bg_error_ = s;
+		bg_cv_.SignalAll();
+	}
+}
 
 DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
 	:env_(raw_options.env),

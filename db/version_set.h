@@ -1,4 +1,31 @@
 
+class Compaction{
+	
+	VersionEdit* edit() { return &edit_; }
+	
+	int num_input_files(int which) const { return inputs_[which].size(); }
+	
+	// 返回input文件
+	FileMetaData* input(int which, int i) const { return inputs_[which][i]; }
+	
+	// 是否是一个trivial compaction，可以通过移动一个input文件到下一层实现，没有merge或者split
+	bool IsTrivialMove() const;
+	
+private:
+	
+	Compaction(const Options* options, int level);
+	
+	int level_;
+	uint64_t max_output_file_size_;
+	Version* input_version_;
+	VersionEdit edit_;
+	
+	// 每次compaction读level_和下一层的inputs
+	std::vector<FileMetaData*> inputs_[2]; // 两个inputs集合
+	
+	std::vector<FileMetaData*> grandparents_;
+};
+
 class Version {
 
 	void Unref();
@@ -22,10 +49,12 @@ class Version {
 	int refs_; // 指向这个Version的引用
 	
 	std::vector<FileMetaData*> files_[config::kNumLevels]; // 每层的文件列表
-	 
+	
+	// 根据seek数据的下一次compact文件
 	FileMetaData* file_to_compact_; // 将compact的文件
 	int file_to_compact_level_;
 	
+	// 下一次compact的层，和compaction评分
 	double compaction_score_; // 小于1表示compaction不必须
 	int compaction_level_;
 
@@ -48,6 +77,18 @@ public:
 	
 	uint64_t NewFileNumber() { return next_file_number_++; }
 	
+	bool NeedsCompaction() const {
+		Version* v = current_;
+		return (v->compaction_score_ >= 1) || (v->file_to_compact_ != NULL);
+	}
+	
+	// 
+	struct LevelSummaryStorage{
+		char buffer[100];
+	};
+	const char* LevelSummary(LevelSummaryStorage* scratch) const;
+	
+	
 private:
 	class Builder;
 	
@@ -66,4 +107,8 @@ private:
 	log::Writer* descriptor_log_; // 写 descriptor_file_
 	Version dummy_versions_; // version链表头
 	Version* current_; // dummy_versions_.prev_
+	
+	// 每一层在下一次compaction开始的key
+	// 空字符串或者有效的InternalKey
+	std::string compact_pointer_[config::kNumLevels];
 };

@@ -22,8 +22,18 @@ private:
 	
 	std::set<uint64_t> pending_outputs_; // 保护的table文件，例如正在进行压缩
 	
+	struct ManualCompaction{
+		int level;
+		bool done;
+		const InternalKey* begin;
+		const InternalKey* end;
+		InternalKey tmp_storage; // 跟踪compaction过程
+	};
+	ManualCompaction* manual_compaction_;
+	
 	VersionSet* versions_;
 	
+	Status bg_error_;
 	
 	// 每一层的compaction统计
 	// stats_[level]存储为level层产生数据的compaction统计
