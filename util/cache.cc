@@ -262,6 +262,11 @@ bool LRUCache::FinishErase(LRUHandle* e)
 	}
 }
 
+void LRUCache::Release(Cache::Handle* handle) {
+	MutexLock l(&mutex_);
+	Unref(reinterpret_cast<LRUHandle*>(handle));
+}
+
 // 当引用计数减少到0时释放，否则从in_use_链表移到lru_链表中
 void LRUHandle::Unref(LRUHandle* e)
 {

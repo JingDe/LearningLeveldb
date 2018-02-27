@@ -210,7 +210,7 @@ void DBImpl::BackgroundCompaction()
 	if(is_manual)
 	{
 		ManualCompaction* m=manual_compaction_;
-		c=versions_->CompactRange(m->level, m->begin, m->end);
+		c=versions_->CompactRange(m->level, m->begin, m->end); // 获得level层需要compact的输入文件
 		m->done = (c==NULL);
 		if(c != NULL)
 			manual_end = c->input(0, c->num_input_files(0)-1) ->largest; // 获得最大的InternalKey
@@ -257,7 +257,29 @@ void DBImpl::BackgroundCompaction()
 	}
 	delete c;
 	
+	if(status.ok())
+	{}
+	else if(shutting_down_.Acquire_Load())
+	{}
+	else
+	{
+		Log(options_.info_log,
+			"Compaction error: %s", status.ToString().c_str());
+	}
 	
+	if(is_manual)
+	{
+		ManualCompaction* m=manual_compaction_;
+		if(!status.ok())
+			m->done =true;
+		if(!m->done)
+		{
+			// 只compact了请求范围的部分，更新m到剩下的范围
+			m->tmp_storage=manual_end;
+			m->begin =&m->tmp_storage;
+		}
+		manual_compaction_ =NULL;
+	}
 }
 
 Status DBImpl::DoCompactionWork(CompactionState* compact)
@@ -281,7 +303,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact)
 	
 	mutex_.Unlock();
 	
-	Iterator* input=versions_->MakeInputIterator(compact->compaction); // 获得需要compaction的所有文件的迭代器
+	Iterator* input=versions_->MakeInputIterator(compact->compaction); // 获得需要compaction的所有文件的迭代器列表
 	input->SeekToFirst();
 	Status status;
 	ParsedInternalKey ikey;
@@ -289,7 +311,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact)
 	bool has_current_user_key =false;
 	SequenceNumber last_sequence_for_key =kMaxSequenceNumber;
 	for(; input->Valid()  &&  !shutting_down_.Acquire_Load(); )
-	{
+	{ // 将所有源文件输出到若干个outfile中
 		if(has_imm_.NoBarrier_Load() !=NULL)
 		{
 			const uint64_t imm_start=env_->NowMicros();
@@ -346,22 +368,75 @@ Status DBImpl::DoCompactionWork(CompactionState* compact)
 			// 必要时打开output文件
 			if(compact->builder ==NULL)
 			{
-				status =OpenCompactionOutputFile(compact);
+				status =OpenCompactionOutputFile(compact); // compaction的结果outfile文件
 				if(!status.ok())
 					break;
 			}
 			if(compact->builder->NumEntries() ==0)
 				compact->current_output()->smallest.DecodeFrom(key);
 			compact->current_output()->largest.DecodeFrom(key);
-			compact->builder->Add(key, input->value());
+			compact->builder->Add(key, input->value()); // builder构建outfile文件
 			
-			
+			if(compact->builder->FileSize() >= compact->compaction->MaxOutputFileSize())
+			{
+				status=FinishCompactionOutputFile(compact, input);
+				if(!status.ok())
+					break;
+			}
 		}
 		
 		input->Next();
 	}
 	
+	if(status.ok()  &&  shutting_down_.Acquire_Load())
+		status = Status::IOError();
+	if(status.ok()  &&  compact->builder!=NULL)
+		status=FinishCompactionOutputFile(compact, input);
+	if(status.ok())
+		status =input->status();
+	delete input;
+	input =NULL;
 	
+	CompactionStats stats;
+	stats.micros =env_->NowMicros() -start_micros -imm_micros;
+	for(int which=0; which<2; which++)
+		for(int i=0; i<compact->compaction->num_input_files(which); i++)
+			stats.bytes_read += compact->compaction->input(which, i)->file_size;
+	for(size_t i=0; i< compact->outputs.size(); i++)
+		stats.bytes_written += compact->outputs[i].file_size;
+	
+	mutex_.Lock();
+	stats_[compact->compaction->level() +1].Add(stats);
+	
+	if(status.ok())
+		status =InstallCompactionResults(compact);
+	if(!status.ok())
+		RecordBackgroundError(status);
+	VersionSet::LevelSummaryStorage tmp;
+	Log(options_.info_log,
+      "compacted to: %s", versions_->LevelSummary(&tmp));
+	return status;
+}
+
+Status DBImpl::InstallCompactionResults(CompactionState* compact)
+{
+	mutex_.AssertHeld();
+	Log(options_.info_log,  "Compacted %d@%d + %d@%d files => %lld bytes",
+      compact->compaction->num_input_files(0),
+      compact->compaction->level(),
+      compact->compaction->num_input_files(1),
+      compact->compaction->level() + 1,
+      static_cast<long long>(compact->total_bytes));
+	
+	compact->compaction->AddInputDeletions(compact->compaction->edit()); // 删除level和level+1层文件
+	const int level=compact->compaction->level();
+	for(size_t i=0; i<compact->outputs.size(); i++)
+	{
+		const CompactionState::Output& out=compact->outputs[i];
+		compact->compaction->edit()->AddFile(level+1, out.number, out.file_size, out.smallest, out.largest);
+				// 添加新创建的level+1层outfile文件
+	}
+	return version_->LogAndApply(compact->compaction->edit(), &mutex_);
 }
 
 Status DBImpl::OpenCompactionOutputFile(CompactionState* compact)
@@ -374,8 +449,17 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact)
 		file_number =versions_->NewFileNumber();
 		pending_outputs_.insert(file_number);
 		CompactionState::Output out;
-		
+		out.number=file_number;
+		out.largest.Clear();
+		compact->outputs.push_back(out);
+		mutex_.Unlock();
 	}
+	
+	std::string fname=TableFileName(dbname_, file_number);
+	Status s=env_->NewWritableFile(fname, &compact->outfile);
+	if(s.ok())
+		compact->builder =new TableBuilder(options_, compact->outfile);
+	return s;
 }
 
 Status DBImpl::FinishCompactionOutputFile(CompactionState* compact, Iterator* input)
@@ -401,9 +485,9 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact, Iterator* in
 	compact->builder =NULL;
 	
 	if(s.ok())
-		s=compact->outfile->Sync();
+		s=compact->outfile->Sync(); //
 	if(s.ok())
-		s=compact->outfile->Close();
+		s=compact->outfile->Close(); // 
 	delete compact->outfile;
 	compact->outfile =NULL;
 	

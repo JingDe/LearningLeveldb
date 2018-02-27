@@ -26,6 +26,15 @@ void MemTable::Add(SequenceNumber s, ValueType type, const Slice& key, const Sli
 	assert( (p+val_size) - buf == encoded_len);
 	table_.Insert(buf);
 }
+bool MemTable::Get(const LookupKey& key, std::string* value, Status* s)
+{
+	// entry format is:
+    //    klength  varint32
+    //    userkey  char[klength]
+    //    tag      uint64
+    //    vlength  varint32
+    //    value    char[vlength]
+}
 
 int MemTable::KeyComparator::operator()(const char* aptr, const char* bptr) const
 {

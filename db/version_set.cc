@@ -42,6 +42,26 @@ int FindFile(const InternalKeyComparator& icmp, const std::vector<FileMetaData*>
 	}
 }
 
+namespace{
+	enum SaverState{
+		kNotFound,
+		kFound,
+		kDeleted,
+		kCorrupt,
+	};
+	struct Saver{
+		SaverState state;
+		const Comparator* ucmp;
+		Slice user_key;
+		std::string* value;
+	};
+}
+static void SaveValue(void* arg, const Slice& ikey, const Slice& v) 
+	// 比较arg.user_key 和iKey 相等，v 赋给 arg->value
+{
+	
+}
+
 // 一个内部迭代器
 // 对给定的version/level对，生成关于level层文件的信息
 // 对给定的entry，key()是出现在文件中的最大key，
@@ -146,40 +166,6 @@ int Version::PickLevelForMemTableOutput(const Slice& smallest_user_key, const Sl
 }
 
 
-VersionSet::VersionSet(const std::string& dbname, const Options* options, TableCache* table_cache, const InternalKeyComparator* cmp)
-	: env_(options->env),
-      dbname_(dbname),
-      options_(options),
-      table_cache_(table_cache),
-      icmp_(*cmp),
-      next_file_number_(2),
-      manifest_file_number_(0),  // 从Recover()获得
-      last_sequence_(0),
-      log_number_(0),
-      prev_log_number_(0),
-      descriptor_file_(NULL),
-      descriptor_log_(NULL),
-      dummy_versions_(this),
-      current_(NULL) 
-{
-	AppendVersion(new Version(this));
-}
-
-void VersionSet::AppendVersion(Version* v)
-{
-	assert(v->refs_==0);
-	assert(v != current_); // current_ == dummy_versions_.prev_
-	if(current_ !=NULL)
-		current_->Unref();
-	current_=v;
-	v->Ref();
-	
-	v->prev_=dummy_versions_.prev; // 将v插入到 dummy_versions_之前（current_位置）
-	v->next_=dummy_versions_;
-	v->perv_->next_ =v;
-	v->next_->prev_ =v;
-}
-
 // 在inputs中存储level层所有与[begin, end]重叠的文件
 void Version::GetOverlappingInputs(int level, const InternalKey* begin, const InternalKey* end, 
 		std::vector<FileMetaData*>* inputs)
@@ -225,6 +211,71 @@ void Version::GetOverlappingInputs(int level, const InternalKey* begin, const In
 			}
 		}
 	}
+}
+
+Status::Version::Get(const ReadOptions& options, const LookupKey& k, std::string* value, GetStats* stats)
+{
+	Slice ikey = k.internal_key();
+	Slice user_key = k.user_key();
+	const Comparator* ucmp = vset_->icmp_.user_comparator();
+	
+	
+	for(uint32_t i=0; i<num_files; ++i)
+	{
+		if(last_file_read != NULL  && stats->seek_file==NULL)
+		{
+			// 此次read已有超过一个seek，charge第一个文件
+			stats->seek_file =last_file_read;
+			stats->seek_file_level =last_file_read_level;
+		}
+		
+		FileMetaData* f=files[i];
+		last_file_read=f;
+		last_file_read_level =level;
+		
+		Saver saver;
+		saver.state=kNotFound;
+		saver.ucmp=ucmp;
+		saver.user_key=user_key;
+		saver.value=value;
+		s=vset_->table_cache_->Get(options, f->number, f->file_size, ikey, &saver, SaveValue);
+		
+		
+	}
+}
+
+VersionSet::VersionSet(const std::string& dbname, const Options* options, TableCache* table_cache, const InternalKeyComparator* cmp)
+	: env_(options->env),
+      dbname_(dbname),
+      options_(options),
+      table_cache_(table_cache),
+      icmp_(*cmp),
+      next_file_number_(2),
+      manifest_file_number_(0),  // 从Recover()获得
+      last_sequence_(0),
+      log_number_(0),
+      prev_log_number_(0),
+      descriptor_file_(NULL),
+      descriptor_log_(NULL),
+      dummy_versions_(this),
+      current_(NULL) 
+{
+	AppendVersion(new Version(this));
+}
+
+void VersionSet::AppendVersion(Version* v)
+{
+	assert(v->refs_==0);
+	assert(v != current_); // current_ == dummy_versions_.prev_
+	if(current_ !=NULL)
+		current_->Unref();
+	current_=v;
+	v->Ref();
+	
+	v->prev_=dummy_versions_.prev; // 将v插入到 dummy_versions_之前（current_位置）
+	v->next_=dummy_versions_;
+	v->perv_->next_ =v;
+	v->next_->prev_ =v;
 }
 
 class VersionSet::Builder{
@@ -687,6 +738,7 @@ Status VersionSet::WriteSnapshot(log::Writer* log)
 	return log->AddRecord(record);
 }
 
+// 获得需要compact的输入文件
 Compaction* VersionSet::CompactRange(int level, const InternalKey* begin, const InternalKey* end)
 {
 	std::vector<FileMetaData*> inputs;
@@ -908,4 +960,9 @@ void Compaction::ReleaseInputs() {
 	}
 }
 
-
+void Compaction::AddInputDeletions(VersionEdit* edit)
+{
+	for(int which=0; which <2; which++)
+		for(size_t i=0; i<inputs_[which].size(); i++)
+			edit->DeleteFile(level_ +which, inputs_[which][i]->number);
+}

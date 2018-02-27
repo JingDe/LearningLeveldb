@@ -1,6 +1,10 @@
 
 class Compaction{
 	
+	// merge level层和level+1层，生成一些level+1层文件
+	int level() const { return level_; }
+	
+	// 返回包含compaction产生的descriptor的edits的对象
 	VersionEdit* edit() { return &edit_; }
 	
 	int num_input_files(int which) const { return inputs_[which].size(); }
@@ -20,13 +24,24 @@ private:
 	Version* input_version_;
 	VersionEdit edit_;
 	
-	// 每次compaction读level_和下一层的inputs
+	// 每次compaction读取level_和下一层的inputs
 	std::vector<FileMetaData*> inputs_[2]; // 两个inputs集合
 	
-	std::vector<FileMetaData*> grandparents_;
+	// 用来检查overlap的grandparent文件的状态
+	std::vector<FileMetaData*> grandparents_; // 
+	size_t grandparent_index_;  // Index in grandparent_starts_
+	bool seen_key_;             // Some output key has been seen
+	int64_t overlapped_bytes_;  // 当前output和grandparent文件之间overlap的字节数
 };
 
 class Version {
+	
+	// 查找key的value
+	struct GetStats{
+		FileMetaData* seek_file;
+		int seek_file_level;
+	};
+	Status Get(const ReadOptions&, const LookupKey& key, std::string* val, GetStats* stats);
 
 	void Unref();
 	
